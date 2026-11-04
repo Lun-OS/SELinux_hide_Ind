@@ -2,6 +2,8 @@ name: Build SELinux_hide_From_LunSU.kpm
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
   build:
@@ -13,12 +15,12 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Show submodule layout (debug)
+      - name: Show submodule pin (sanity)
         run: |
-          echo "=== repo root ==="
-          ls -la
-          echo "=== .gitmodules ==="
-          cat .gitmodules || true
+          echo "=== repo root ==="; ls -la
+          echo "=== .gitmodules ==="; cat .gitmodules
+          echo "=== KernelPatch HEAD ==="
+          git -C KernelPatch log --oneline -1
 
       - name: Install aarch64 cross toolchain
         run: |
@@ -28,14 +30,20 @@ jobs:
       - name: Build KPM
         run: |
           export TARGET_COMPILE=aarch64-linux-gnu-
-          export KP_DIR=../KernelPatch
+          export KP_DIR=$GITHUB_WORKSPACE/KernelPatch
           cd SELinux_hide_From_LunSU
           make clean
-          make
+          make 2>&1 | tee build.log
+          # 防呆：旧 KP 头会让 KPM_EVENT 静默退化成函数声明（模块能加载但永不工作）
+          if grep -q "KPM_EVENT" build.log && grep -q "implicit-int\|no type or storage class" build.log; then
+            echo "::error::KPM_EVENT not expanded - KernelPatch submodule is too old (need >= d4c88d6)"
+            exit 1
+          fi
 
-      - name: Verify artifact
+      - name: Verify .kpm.event section is present
         run: |
-          ls -l SELinux_hide_From_LunSU/*.kpm
+          aarch64-linux-gnu-readelf -S SELinux_hide_From_LunSU/SELinux_hide_From_LunSU.kpm | grep -E "kpm\.(event|init)" \
+            || { echo "::error::.kpm.event section missing - event callback will never fire"; exit 1; }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
