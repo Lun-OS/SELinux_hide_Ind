@@ -27,9 +27,11 @@ jobs:
 
       - name: Build KPM
         run: |
+          export TARGET_COMPILE=aarch64-linux-gnu-
+          export KP_DIR=../KernelPatch
           cd SELinux_hide_From_LunSU
           make clean
-          make TARGET_COMPILE=aarch64-linux-gnu- KP_DIR=../KernelPatch
+          make
 
       - name: Verify artifact
         run: |
