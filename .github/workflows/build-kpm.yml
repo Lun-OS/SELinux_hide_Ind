@@ -1,0 +1,43 @@
+name: Build SELinux_hide_From_LunSU.kpm
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Show submodule layout (debug)
+        run: |
+          echo "=== repo root ==="
+          ls -la
+          echo "=== .gitmodules ==="
+          cat .gitmodules || true
+
+      - name: Install aarch64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build KPM
+        run: |
+          cd SELinux_hide_From_LunSU
+          make clean
+          make TARGET_COMPILE=aarch64-linux-gnu- KP_DIR=../KernelPatch
+
+      - name: Verify artifact
+        run: |
+          ls -l SELinux_hide_From_LunSU/*.kpm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SELinux_hide_From_LunSU-kpm
+          path: SELinux_hide_From_LunSU/SELinux_hide_From_LunSU.kpm
+          if-no-files-found: error
