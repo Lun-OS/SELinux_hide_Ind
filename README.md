@@ -14,6 +14,9 @@
 | 特权（uid<10000） | /access、/context 由门截住，从副本应答；渲染失败 fail-open 回落内核原版 |
 | 组件进域 | uid==0 且 exec 路径在 /data/adb 下 → exec 钩子把新进程域写为 su（出厂类型） |
 
+## 项目方法思路
+![大致参考图](./docs/SELinux_hide_01.png)
+
 ## 实现路径（按数据流）
 
 ```
