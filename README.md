@@ -1,5 +1,10 @@
 # SELinux_hide_From_LunSU (KPM)
 
+实现方向是让出厂策略不被修改。劫持所有对出厂策略的修改到备份的策略中，也就是策略恒定与出厂相同，备份策略含模块规则等
+非特权就直接透传到出厂策略内核原生作答，特权信任进程就是直接到我们的副本进行作答
+理论这样非特权检测器就几乎很难做到时序检测和语义检测
+当前项目仅作为一个DEMO参考，正在努力研究喵
+
 大部分为vibe的代码，代码质量一般，在某些设备会产生兼容性问题，可能是不生效也可能会导致设备无法启动，测试时需要保证有救砖的能力
 初创新项目，不稳定，玻璃心不喜勿喷qwq，大佬们可以提建议
 
@@ -7,72 +12,79 @@
 
 | 词汇 | 含义 |
 |---|---|
-| live | 出厂策略 + su 三件套（inbound 规则、permissive 位、role 条件位）——仅此而已 |
-| 副本 | live 的内核构建拷贝 + su 盖章（全类全权），特权查询的答题主 |
-| 模块规则 | 永不进 live；/load 写入被门吸收（blob 全丢弃，假成功），模块自身的批规则走 KPM 控制面进副本 |
+| live | 出厂策略 |
+| 副本 | live 的内核构建拷贝 + 其他注入规则，特权查询的答题主 |
+| 模块规则 | 永不进 live；/load 写入被门吸收，模块自身的批规则走 KPM 控制面进副本 |
 | 非特权（uid≥10000） | 到不了引擎：出厂 avc 权限检查（compute_av 等）天然挡死，透传=出厂答案 |
 | 特权（uid<10000） | /access、/context 由门截住，从副本应答；渲染失败 fail-open 回落内核原版 |
-| 组件进域 | uid==0 且 exec 路径在 /data/adb 下 → exec 钩子把新进程域写为 su（出厂类型） |
 
-## 项目方法思路
-![大致参考图](./docs/SELinux_hide_01.png)
+## 实现路径（流程图）
+### 图 1：KPM 总决策流程图
+```mermaid
+flowchart TD
+    classDef blue fill:#E6F1FB,stroke:#185FA5,color:#0C447C
+    classDef yellow fill:#FAEEDA,stroke:#854F0B,color:#633806
+    classDef green fill:#EAF3DE,stroke:#3B6D11,color:#27500A
+    classDef gray fill:#F1EFE8,stroke:#5F5E5A,color:#444441
+    classDef purple fill:#EEEDFE,stroke:#534AB7,color:#3C3489
+    classDef white fill:#FFFFFF,stroke:#EF9F27,color:#633806
 
-## 实现路径（按数据流）
+    A([系统开机]):::gray --> B[KPM 装载：绑定内核符号 kallsyms]:::blue
+    B --> C{必需内核符号<br/>齐全吗？}:::yellow
+    C -- 否 --> D[引擎关闭<br/>零干预]:::gray
+    C -- 是 --> E[KPM 事件期 early-init/init…<br/>挂 bprm 钩子]:::blue
+    E --> F{首个 execve？<br/>进程上下文}:::yellow
+    F -- 否 · 等待 --> E
+    F -- 是 --> G[首个 exec：se_install_engine<br/>可睡眠进程上下文<br/><br/>标定 live 策略 → 解析 su/magisk 域 type/sid → 布局推导<br/>挂 avc_denied 决策面 + 活体自检 失败 → 降级，门照装<br/>se_build_copy 重建副本 → 尾部建 KSU 规则表<br/>装五门 access/context/load/policy/status → avc flush]:::yellow
+    G --> H[引擎 up · 日常运行]:::blue
+    H --> I[任意一次 SELinux 请求<br/>查询 / 改规则 / 读策略 / deny]:::blue
+    I --> J{是否为特权进程？<br/>uid &lt; 10000}:::yellow
+    J -- 否 · uid≥10000 --> K[五门透传原版 fallback<br/>deny 未命中 → 原生处理]:::blue
+    K --> L([与未 root 逐位一致]):::green
+    J -- 是 · uid&lt;10000 --> SG
 
-```
-boot ──> KP event(post-fs-data) ──> 延迟安装（sehide_main.c）
-         │
-         ├─ 符号解析 se_symbol.c：三级链
-         │    L1 kallsyms_lookup_name(KP 填充) → L2 kallsyms_on_each_symbol(<5.10)
-         │    → L3 KP by_suffix；static 符号依赖 CONFIG_KALLSYMS_ALL
-         │
-         ├─ 标定 se_layout.c：黑盒布局探测（无硬编码偏移）
-         │    se_probe 在模拟布局上定位 permissive_map/te_avtab/len/v2n/v2s，
-         │    再用真实内存验证反推 policydb 基址；cred blob 偏移、sidtab、
-         │    selinux_state container 同法（4.19 直读 / 5.1+ selinux_cred 偏移）
-         │
-         ├─ live 写入 se_policydb.c：se_apply_trio()
-         │    inbound 24 条（avtab nel 差值计量）+ permissive 位（幂等预查）
-         │    + role 位；写入即扩 policydb.len（每 avtab 条 12B、每 ebitmap
-         │    新窗口 12B）——6.0+ 防读 /policy -EINVAL，≤5.19 防 vmalloc 越界写
-         │
-         ├─ 门 se_gate.c：fops 数据槽替换（fp_hook + 回读验证）
-         │    /load（sel_load_ops）：uid0 blob 全丢弃，live 不真重载
-         │    /access /context（write_op[] 槽，按值扫描非下标）：uid<10000
-         │      答副本，渲染失败 fail-open；-22=出厂 EINVAL 同款
-         │
-         ├─ 切域 se_bprm.c：bprm 钩子（≤6.11 hook_heads 数据槽 / 6.12+ 影子页，
-         │    扫描失败自动降级）；orig 后写 cred（幂等），无内核指令写入
-         │
-         ├─ 副本 se_policydb.c：内核 policydb_read 自建（手工构造
-         │    policy_file{data,len}，布局全版本恒定），换代即销毁重建
-         │
-         └─ 自愈 se_recal.c：live 指纹三锚（container/len/vers）
-              4.19 原地 memcpy / 6.1+ RCU 指针替换双路径；
-              失配 → 重标定 → 重写三件套 + 副本换代 + avc_ss_reset 补刷
-              （仅进程上下文调用，禁 KP event RCU 临界区——v44 教训）
+    subgraph SG["特权侧五门分流"]
+        direction TB
+        M1[access / context 查询 → 副本求值<br/>败则回落原版]:::white
+        M2[load 写策略 → 异步吸收进副本<br/>盖章 + 换代]:::white
+        M3[policy 读 → 答镜像<br/>出厂 + 生态规则]:::white
+        M4[status 读状态 → 特权见真实值]:::white
+        M5[内核 deny → avc_denied 决策面<br/>见附图 2]:::purple
+    end
+
+    class SG yellow
 ```
 
-## 构建 / 部署
+### 图 2：avc_denied 决策面判定树
 
+```mermaid
+flowchart TD
+    classDef yellow fill:#FAEEDA,stroke:#854F0B,color:#633806
+    classDef green fill:#EAF3DE,stroke:#3B6D11,color:#27500A
+    classDef red fill:#FCEBEB,stroke:#A32D2D,color:#791F1F
+
+    A([avc_denied：内核全部 deny 判定唯一收口]):::yellow --> B{与 su / 组件域相关吗？<br/>sid 匹配 · uid 不参与本层}:::yellow
+    B -- 否 --> C{副本生态规则允许吗？<br/>查副本 avtab}:::yellow
+    C -- 有 --> FLIP
+    C -- 无 --> ORIG
+    B -- 是 --> D{源是 su / comp 吗？<br/>outbound · 主动发出}:::yellow
+    D -- 是 --> FLIP
+    D -- 否 --> E{命中 KSU 白名单吗？<br/>inbound · 类 + perm + 源域 sid}:::yellow
+    E -- 命中 --> FLIP
+    E -- 否 --> F{副本生态规则允许吗？<br/>副本收口 · 查副本 avtab}:::yellow
+    F -- 有 --> FLIP
+    F -- 否 --> G{live 策略异常吗？<br/>se_live_ok 三锚点}:::yellow
+    G -- 是 --> H[se_recalibrate<br/>重标 sid · 重建副本 · 刷 KSU 表]:::yellow
+    H -. 重判 .-> B
+    G -- 否 --> ORIG
+
+    FLIP([flip：改栈上 avd<br/>全类置满 / 位组按位 OR → return 0<br/>不写缓存，live 恒干净]):::green
+    ORIG([orig：trampoline 透传 KP<br/>原始 avc_denied ＝ 出厂行为]):::red
 ```
-# WSL 内，aarch64 交叉编译
-make clean && make TARGET_COMPILE=aarch64-linux-gnu- KP_DIR=../KernelPatch
-# 产物：SELinux_hide_From_LunSU.kpm → kptools -M 嵌入 boot 镜像
-```
 
-验证判据（dmesg）：`calib ok` → `live trio ... len+NB` → `engine up` → `component exec -> su domain rc=0`；异常路径有一次性诊断打印（`degraded`/`rc=-22`）。
+## 参考技术项目
+[KernelSU](https://github.com/tiann/KernelSU):SELinux策略深度拷贝与渲染器
 
-## 文件
+[KernelPatch](https://github.com/bmax121/KernelPatch/):基础框架与魔数计算
 
-| 文件 | 职责 |
-|---|---|
-| sehide_main.c | 入口、延迟安装、feature 开关、事件回调 |
-| se_symbol.c | 符号解析三级链 + 全部 p_* 绑定 |
-| se_layout.c | 黑盒标定链（布局/偏移/状态结构定位） |
-| se_policydb.c | live 三件套、副本构建/换代、/load 吸收 |
-| se_gate.c | 三道门（load/access/context）fops 劫持与应答 |
-| se_bprm.c | bprm 钩子安装（数据槽/影子页）+ 组件域切轨 |
-| se_recal.c | 指纹自愈、重标定、AVC 刷新 |
-| se_rules.c | inbound 规则表（对齐 LunSU apply_inbound_rules） |
-| se_util.c / se_stealth.c / se_status.c | 内存读写原语 / 隐蔽辅助 / status（未启用） |
+
