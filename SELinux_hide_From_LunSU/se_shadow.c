@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * se_shadow.c - v54 新增：mkpms 式页分裂影子页 hook。
+ * se_shadow.c - mkpms 式页分裂影子页 hook。
  *
  * 原理（全部源码实证，禁止猜测）：
  *   KP 的 hook()/fp_hook() 都走 hotpatch_nosync（hotpatch.c:80-95）——清 stage-1
  *   PTE 的 RO 位后裸写原 VA，即写原物理页。stage-2（MTK MKP/EL2）锁的是物理页，
- *   v12 装机实证 text 写必死。影子页方案：分配新物理页承载修改，改 stage-1 页表
- *   （页表页不在 MKP 的 krn code/krn rodata 保护清单，v12 证据链）让 VA 执行流走
+ *   装机实证 text 写必死。影子页方案：分配新物理页承载修改，改 stage-1 页表
+ *   （页表页不在 MKP 的 krn code/krn rodata 保护清单）让 VA 执行流走
  *   影子页，原物理页一字节不动。
  *
  * 坐标系重建：
@@ -161,6 +161,8 @@ static se_u64 se_pa(se_u64 va)
     return pa ? pa + (va & ((1ull << ps) - 1ull)) : 0;
 }
 
+static se_u64 linear_voff_override;
+
 int se_shadow_init(void)
 {
     se_u64 tcr, ttbr1, memstart = 0, kimgvoff = 0;
@@ -184,39 +186,100 @@ int se_shadow_init(void)
         MM.page_level = (va_bits - 4) / pxd_bits;       /* map.c:156 同式 */
     }
 
+    /*
+     * linear 映射偏移改用 KP 的运行期实测值。
+     *
+     * 根因终审（br_0249 闭环）：memstart 双源同值（0x40000000，合理）
+     * 但 walk 仍 0 → 公式假设（PAGE_OFFSET=-(1<<va_bits)、PHYS_OFFSET=
+     * memstart_addr、或运算等价性）与该设备内核实际线性映射配置不符。
+     * KP 的 linear_voffset（map.c:141-148 verbatim）在 boot 早期用内核
+     * memblock 分配器传精确 phys 拿 virt 实测——绕开一切公式假设，KP
+     * hook 在本机工作正常即其正确性的活体证明。KP 的实测函数是 __init
+     * （boot 后已释放），KPM install 时机无法重演 → 直接读 KP 实测好的
+     * linear_voffset 全局（symbol_lookup_name 走 KP 符号表，精确）。
+     * 这是 boot 期才可获得的信息、KP 宿主必在——"必须经过"边界内的
+     * 数据依赖，非机制依赖。旧公式保留为兜底（KP 符号缺失时）。
+     * 强自证 = walk(_text) PA == va-kimgvoff（三方自洽）不变。
+     */
+    {
+        unsigned long kp_lvoff = symbol_lookup_name("linear_voffset");
+        se_u64 lv = 0;
+
+        if (kp_lvoff && !se_kread(&lv, (void *)kp_lvoff, 8) && lv)
+            linear_voff_override = lv;
+    }
+
     if (se_kread(&memstart, (void *)(se_ulong)p_memstart, 8))
         return -2;
     if (se_kread(&kimgvoff, (void *)(se_ulong)p_kimage_voff, 8))
         return -3;
 
-    /* PAGE_OFFSET = -(1<<va_bits)（memory.h:44）；PHYS_OFFSET = memstart_addr
-     * （memory.h:204）；__phys_to_virt(x) = (x - PHYS_OFFSET) | PAGE_OFFSET
-     * （memory.h:308）=> linear_voff = PAGE_OFFSET - PHYS_OFFSET */
-    MM.linear_voff = (se_u64)(0ull - (1ull << (64 - t1sz))) - memstart;
-    MM.kimage_voff = kimgvoff;
-
-    /* pgd：TTBR1_EL1 BADDR（map.c:165-168 同式） */
-    __asm__ __volatile__("mrs %0, ttbr1_el1" : "=r"(ttbr1));
-    MM.pgd_va = (ttbr1 & 0xFFFFFFFFFFFEull) + MM.linear_voff;
-
-    /* 自证①：TTBR1 即内核主 pgd（swapper_pg_dir - kimage_voffset）。
-     * KPTI 内核运行期 TTBR1 也是 swapper_pg_dir（tramp_pg_dir 仅入口切换用）。 */
-    if ((ttbr1 & 0xFFFFFFFFFFFEull) !=
-        ((se_u64)p_swapper - kimgvoff)) {
-        pr_info("sehide: shadow selfcheck1 fail ttbr1=%016lx swapper=%016lx kimgvoff=%016llx\n",
-                (unsigned long)(ttbr1 & 0xFFFFFFFFFFFEull),
-                (unsigned long)p_swapper, (unsigned long long)kimgvoff);
-        return -4;
-    }
-
-    /* 自证②：walk(_text) 的 PA 与 kimg 换算一致（walk/phys/偏移三方自洽） */
+    /*
+     * memstart_addr 是 D 段数据符号，L1 对其错地址（secclass_map
+     * 同族实证）→ linear_voff 错 → walk
+     * 全链 0（历次装机 selfcheck2 fail phys=0，selfcheck1
+     * 不依赖 linear 故仍过——日志特征吻合）。修复：走完换算+自证②，
+     * 失败时用 KP 全表枚举重解析 memstart_addr 再试一轮；强自证 =
+     * walk(_text) 的 PA 与 kimg 换算一致（三方自洽），错值必然失败。
+     * 两轮都失败 → MM.ok=0（影子页整支关闭，fail-closed）。
+     */
     {
-        se_u64 phys = se_pa((se_u64)p_text);
+        int retry;
 
-        if (!phys || phys != (se_u64)p_text - kimgvoff) {
-            pr_info("sehide: shadow selfcheck2 fail text=%016lx phys=%016llx\n",
-                    (unsigned long)p_text, (unsigned long long)phys);
-            return -5;
+        for (retry = 0; retry < 2; retry++) {
+            se_u64 phys;
+
+            /* PAGE_OFFSET = -(1<<va_bits)（memory.h:44）；PHYS_OFFSET =
+             * memstart_addr（memory.h:204）；__phys_to_virt(x) =
+             * (x - PHYS_OFFSET) | PAGE_OFFSET（memory.h:308）=>
+             * linear_voff = PAGE_OFFSET - PHYS_OFFSET */
+            /* KP 实测值优先（boot 期 memblock 实测，见上）；公式为兜底 */
+            MM.linear_voff = linear_voff_override ?
+                linear_voff_override :
+                (se_u64)(0ull - (1ull << (64 - t1sz))) - memstart;
+            MM.kimage_voff = kimgvoff;
+
+            /* pgd：TTBR1_EL1 BADDR（map.c:165-168 同式） */
+            __asm__ __volatile__("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+            MM.pgd_va = (ttbr1 & 0xFFFFFFFFFFFEull) + MM.linear_voff;
+
+            /* 自证①：TTBR1 即内核主 pgd（swapper_pg_dir - kimage_voffset）。
+             * KPTI 内核运行期 TTBR1 也是 swapper_pg_dir（tramp_pg_dir 仅
+             * 入口切换用）。不依赖 linear_voff，两轮等价。 */
+            if ((ttbr1 & 0xFFFFFFFFFFFEull) !=
+                ((se_u64)p_swapper - kimgvoff)) {
+                pr_info("sehide: shadow selfcheck1 fail ttbr1=%016lx "
+                        "swapper=%016lx kimgvoff=%016llx\n",
+                        (unsigned long)(ttbr1 & 0xFFFFFFFFFFFEull),
+                        (unsigned long)p_swapper,
+                        (unsigned long long)kimgvoff);
+                return -4;
+            }
+
+            /* 自证②：walk(_text) 的 PA 与 kimg 换算一致（三方自洽） */
+            phys = se_pa((se_u64)p_text);
+            if (phys && phys == (se_u64)p_text - kimgvoff)
+                break;                   /* 本轮换算可信 */
+
+            pr_info("sehide: shadow selfcheck2 retry=%d text=%016lx "
+                    "phys=%016llx memstart=%016llx src=%s\n",
+                    retry, (unsigned long)p_text,
+                    (unsigned long long)phys,
+                    (unsigned long long)memstart,
+                    retry ? "enum" : "l1");
+
+            if (retry)
+                return -5;               /* 两轮皆败：影子页整支关闭 */
+
+            /* KP 全表枚举重解析 memstart_addr（D 段可靠通道），重算再验 */
+            {
+                unsigned long m2 = se_sym_via_enum("memstart_addr");
+
+                if (!m2 || se_kread(&memstart, (void *)m2, 8)) {
+                    pr_info("sehide: shadow memstart enum unavailable\n");
+                    return -6;
+                }
+            }
         }
     }
 

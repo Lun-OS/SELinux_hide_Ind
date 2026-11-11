@@ -1,5 +1,5 @@
 /*
- * v61：status 页冻结（LunSU fake_status 的 KPM 移植，最小实现）。
+ * status 页冻结（LunSU fake_status 的 KPM 移植，最小实现）。
  *
  * 背景：/sys/fs/selinux/status 是世界可读的内核状态页，其中 policyload
  * 字段每次策略载入 +1（出厂 boot 只载 1 次）。KP 核心重载与模块策略

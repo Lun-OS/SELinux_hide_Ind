@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* se_symbol：kallsyms/KP 符号解析 - 自 v52 单文件纯搬移切分（sehide.h 为共享头） */
+/* se_symbol：kallsyms/KP 符号解析 */
 #include "sehide.h"
 
 /* ---------------- 符号解析（含 LTO 变体） ---------------- */
@@ -24,7 +24,7 @@ int walk_cb(void *data, const char *name, struct module *mod, unsigned long addr
 }
 
 /*
- * v82：三级符号解析链。
+ * 三级符号解析链。
  *
  * 6.1 GKI 装机（fp_br21）实证：KP 填给 KPM 的 kallsyms_lookup_name 函数
  * 指针在 GKI 6.1.157 上失效（security_read_policy/selinux_state 解析出
@@ -35,14 +35,18 @@ int walk_cb(void *data, const char *name, struct module *mod, unsigned long addr
  *
  * 三级顺序固定、谁通谁生效：
  *   L1  内核 kallsyms_lookup_name（KP 填的指针）—— 4.19 等一级命中；
- *   L2  内核 kallsyms_on_each_symbol 遍历 —— 仅 kver<5.10（walk_cb 为
- *       4.19 签名，5.10+ 签名不同不可混用；5.10+ 由 L3 承担）；
+ *   L2  内核 kallsyms_on_each_symbol 遍历 —— 仅 kver<5.10 保守启用。
+ *       walk_cb 是 4 参回调（带 struct module *）；主线在 v6.4 才把回调
+ *       改成 3 参（kernel/kallsyms.c v6.3:291 vs v6.4:291，不是旧注写的 6.6）。
+ *       5.10-6.3 本可继续用 4 参回调，但为不扩大未实机验证的路径，
+ *       保持原有「5.10+ 交 L3」的保守划分。
  *   L3  KP 的 kallsyms_lookup_name_by_suffix —— KP 符号表导出，
  *       KP 内部已做签名适配，GKI 6.x 实证可用。
  * 全失败返回 0（引擎照旧安全 off），任一级成功即用。
  */
 static unsigned long p_ksym_by_suffix;   /* KP 的 kallsyms_lookup_name_by_suffix */
 static int g_sym_diag;                   /* 一次性诊断计数 */
+static int se_sym_lto_suffix(const char *name);   /* LTO 后缀枚举启用清单 */
 
 unsigned long se_sym(const char *name)
 {
@@ -54,7 +58,7 @@ unsigned long se_sym(const char *name)
             return addr;
     }
 
-    if (kver < VERSION(5, 10, 0) && kallsyms_on_each_symbol) {
+    if (kver < SE_KVER_510 && kallsyms_on_each_symbol) {
         struct walk_ctx ctx;
 
         ctx.base = name;
@@ -76,14 +80,109 @@ unsigned long se_sym(const char *name)
         }
     }
 
+    /*
+     * L1.5：LTO 数字后缀枚举。
+     *
+     * 6.1 GKI ThinLTO 把内核 static 符号重命名为 "<name>.<partition>"——
+     * 本机实证 context_struct_compute_av -> "context_struct_compute_av.72"
+     * （设备 kallsyms.txt t 段 verbatim），精确名与 .llvm 回退均不命中。
+     * 6.1 无 kallsyms_on_each_symbol（kallsyms.c:288 注释：
+     * "use module_kallsyms_on_each_symbol instead"——模块版够不到内核 t 段），
+     * 内核 kallsyms_lookup_name 有符号本体（T 段）但无导出。
+     *
+     * 枚举 "<name>.0" .. "<name>.999" 走 KP 填的 kallsyms_lookup_name
+     * （install 一次性，最坏 1000 次二分查询，微秒级）；命中即校验
+     * 内核地址形态。只对显式登记的决策关键符号启用（最小侵入）。
+     */
+    if (kallsyms_lookup_name && se_sym_lto_suffix(name)) {
+        /* KPM 无 libc：手工拼接 "<base>.<n>"（base 为登记表常量）。
+         * KSYM_NAME_LEN 不可假设，缓冲按 kallsyms 上限 128 取。 */
+        char buf[128];
+        unsigned int n, m, bl;
+
+        bl = 0;
+        while (name[bl] && bl < sizeof(buf) - 12u) {
+            buf[bl] = name[bl];
+            bl++;
+        }
+        for (n = 0; n < 1000u; n++) {
+            m = bl;
+            buf[m++] = '.';
+            if (n >= 100u) buf[m++] = (char)('0' + n / 100u);
+            if (n >= 10u)  buf[m++] = (char)('0' + (n / 10u) % 10u);
+            buf[m++] = (char)('0' + n % 10u);
+            buf[m] = '\0';
+
+            addr = kallsyms_lookup_name(buf);
+            if (addr && ((se_ulong)addr >> 48) == 0xffffull) {
+                if (g_sym_diag < 4) {
+                    g_sym_diag++;
+                    pr_info("sehide: sym '%s' resolved as '%s' via LTO suffix enum\n",
+                            name, buf);
+                }
+                return addr;
+            }
+        }
+        addr = 0;
+    }
+
     if (g_sym_diag < 6) {
         g_sym_diag++;
         pr_info("sehide: sym '%s' unresolved (k=%llu oes=%llu sfx=%llu)\n",
                 name, (se_u64)(se_ulong)kallsyms_lookup_name,
-                (se_u64)(se_ulong)(kver < VERSION(5, 10, 0) ? kallsyms_on_each_symbol : 0),
+                (se_u64)(se_ulong)(kver < SE_KVER_510 ? kallsyms_on_each_symbol : 0),
                 (se_u64)p_ksym_by_suffix);
     }
     return 0;
+}
+
+/* LTO 后缀枚举的启用清单——只登记"绑定失败即功能静默失效"的
+ * 决策关键符号。本机实证：context_struct_compute_av MISSING 时
+ * /access 特权查询整链 fallback 到出厂 live，su 域查任何服务
+ * （package_service:find 等）deny —— apd/MT 的 pm 即此根因。 */
+static const char *const se_lto_suffix_syms[] = {
+    "context_struct_compute_av",
+    "evaluate_cond_nodes",
+    (char *)0,
+};
+
+static int se_sym_lto_suffix(const char *name)
+{
+    const char *const *p;
+
+    for (p = se_lto_suffix_syms; *p; p++)
+        if (se_streq(name, *p))          /* 项目规范：se_streq（se_util） */
+            return 1;
+    return 0;
+}
+
+/*
+ * KP 全表按名枚举解析（D 段数据符号的可靠通道）。
+ * se_sym 的 L1（kallsyms_lookup_name）对部分 D 段符号返回错地址
+ * （security_read_policy / secclass_map / memstart_addr 装机
+ * 实证同族），本函数经 KP 导出的 kallsyms_on_each_match_symbol
+ * （start.c:148 KP_EXPORT_SYMBOL，全 kallsyms 表精确名匹配回调）取
+ * 首个命中地址——内核官方机制确定调用，非扫描。调用方必须自行自证
+ * （地址内容特征校验），错地址在本函数无法甄别。
+ * 依赖 p_ksym_each 绑定；未绑定/枚举无命中返回 0。
+ */
+static int se_sym_enum_cb(void *data, unsigned long addr)
+{
+    *(unsigned long *)data = addr;
+    return 1;                            /* 非 0 = 停止遍历（首命中） */
+}
+
+unsigned long se_sym_via_enum(const char *name)
+{
+    unsigned long addr = 0;
+
+    if (!p_ksym_each || !name)
+        return 0;
+    ((int (*)(int (*)(void *, unsigned long), const char *, void *))
+         p_ksym_each)(se_sym_enum_cb, name, &addr);
+    if (addr && ((se_ulong)addr >> 48) != 0xffffull)
+        return 0;                        /* 非内核地址形态：按失败处理 */
+    return addr;
 }
 
 void se_sym_fill(struct sym_slot *s)
@@ -98,6 +197,12 @@ void se_sym_fill(struct sym_slot *s)
 
 unsigned long p_read_policy;
 unsigned long p_pdb_read;
+unsigned long p_eval_conds;   /* evaluate_cond_nodes */
+unsigned long p_kwrite;       /* copy_to_kernel_nofault */
+unsigned long p_adenied;      /* avc_denied 最终地址（经 patch_config 链解析） */
+unsigned long p_adenied_l3;   /* L3 直查的 avc_denied（与 patch_config 互证备用） */
+unsigned long p_patch_text;   /* 内核 aarch64_insn_patch_text（挂载/卸载执行原语） */
+unsigned long p_ahp;          /* avc_has_perm（决策面活体自检用，全局 T 符号） */
 unsigned long p_pdb_write;
 unsigned long p_pdb_destroy;
 unsigned long p_kread;
@@ -111,10 +216,17 @@ unsigned long p_kthread_should_stop;
 unsigned long p_msleep_interruptible;
 unsigned long p_flex_prealloc;
 unsigned long p_flex_get;
-unsigned long p_str_to_ctx;
 unsigned long p_ctx_to_str;
 unsigned long p_compute_av;
 unsigned long p_sidtab_entry;
+unsigned long p_secclass_map;   /* 源 A 备用（kallsyms D 段，带自证） */
+unsigned long p_ksym_each;      /* KP kallsyms_on_each_match_symbol（全表按名遍历，D 段可靠） */
+unsigned long p_str2cls;        /* 内核 string_to_security_class（policydb.c:1809，T 段） */
+unsigned long p_str2av;         /* 内核 string_to_av_perm（policydb.c:1822，T 段） */
+unsigned long p_pdb_write;      /* policydb_write（policydb.h:325，T 段——副本序列化） */
+unsigned long p_vmalloc_user;   /* vmalloc_user（T 段，与原版 security_read_policy 同款分配） */
+unsigned long p_vfree;          /* vfree（T 段） */
+unsigned long p_sel_open_policy; /* sel_open_policy（T 段，读门调用点自证锚） */
 unsigned long p_write_op;
 unsigned long p_sel_write_access;
 unsigned long p_sel_write_context;
@@ -151,7 +263,7 @@ unsigned long p_kfree;
  *     6.5 属误判（merge window 实为 6.4）。
  *   - 内部 avc_flush 的 avc_node_delete 自 4.19 到 6.12 一律 call_rcu
  *     异步释放，函数自身不 synchronize_rcu —— 进程上下文调用安全；
- *     真正不能碰的是 RCU 读临界区（v44 在 KP event 线程调它挂了第一屏）。
+ *     真正不能碰的是 RCU 读临界区（从 KP event 线程调用会挂死第一屏）。
  *   - avc 指针：4.19~6.4 内核重载路径用 state->avc，而 selinux_avc_init
  *     就是 `*avc = &selinux_avc`（avc.c 文件级单例，static 但进 kallsyms
  *     b 段，4.19~6.12 各版均有）—— 所以传全局实例地址本身，
@@ -163,7 +275,7 @@ unsigned long p_kfree;
 unsigned long p_avc_reset;
 unsigned long p_avc_struct;
 
-struct sym_slot syms[35] = {
+struct sym_slot syms[34] = {
     { "selinux_state", 0, "" },
     { "security_read_policy", 0, "" },
     { "policydb_read", 0, "" },
@@ -175,7 +287,6 @@ struct sym_slot syms[35] = {
     { "ebitmap_get_bit", 0, "" },
     { "security_cred_getsecid", 0, "" },
     { "security_secctx_to_secid", 0, "" },
-    { "string_to_context_struct", 0, "" },
     { "context_struct_to_string", 0, "" },
     { "context_struct_compute_av", 0, "" },
     { "write_op", 0, "" },
@@ -214,17 +325,17 @@ unsigned long p_kp_unhook;
  * 行为不变，只是少了这层防御性判据。
  */
 unsigned long p_kuid;
-unsigned long p_set_sec_override;   /* v81：组件域切轨用（设备 kallsyms T 实证） */
+unsigned long p_set_sec_override;   /* 组件域切轨用（设备 kallsyms T 实证） */
 /* 新增（改①②）：定义补齐（sehide.h 仅 extern） */
 unsigned long p_sel_write_load;
 unsigned long p_copy_from_user;
 unsigned long p_filp_open;
 unsigned long p_filp_close;
 unsigned long p_kernel_read;
-unsigned long p_sel_read_status;   /* v61：status 冻结 */
-unsigned long p_status_ops;        /* v61：sel_handle_status_ops（r 段数据符号） */
+unsigned long p_sel_read_status;   /* status 冻结 */
+unsigned long p_status_ops;        /* sel_handle_status_ops（r 段数据符号） */
 
-/* v54：影子页/坐标系（定义） */
+/* 影子页/坐标系（定义） */
 unsigned long p_sel_load_ops;
 unsigned long p_vmalloc;
 unsigned long p_vfree;
@@ -246,6 +357,67 @@ void se_bind_symbols(void)
     p_selinux_state  = se_sym("selinux_state");
     p_read_policy    = se_sym("security_read_policy");
     p_pdb_read       = se_sym("policydb_read");
+    /* 副本条件规则状态初始化原语。内核 security_load_policy 在
+     * policydb_read 之后必调 evaluate_cond_nodes（services.c:3132）——
+     * cond_node.curr_state 是运行时字段，策略二进制里没有；副本缺这一步
+     * 则条件规则恒取 false 分支，非 su 特权查询的副本答案与 live 不一致。
+     * 设备 kallsyms T 段全局符号（verbatim），同样登记 LTO 后缀枚举保险。 */
+    p_eval_conds     = se_sym("evaluate_cond_nodes");
+    /* 门输出方向的安全写原语（transaction 的响应页是内核地址，
+     * copy_to_user 对其必 EFAULT——与输入方向 strncpy_from_user 同源的错误，
+     * 设备 kallsyms T 段全局 verbatim）。 */
+    p_kwrite         = se_sym("copy_to_kernel_nofault");
+    /* copy_to_kernel_nofault 是 v5.8 改名（旧名 probe_kernel_write），
+     * 4.19 上查不到 → p_kwrite=0 → se_kwrite 恒 -1 → 门输出恒 fallback
+     * （br_0713 定案：lspd addService SecurityException、find denied
+     * flags=0 回落 live）。回退绑定与 p_kread 既有两级回退对称；
+     * 4.19 mm/maccess.c:51 probe_kernel_write 三参同 ABI、0=成功。 */
+    if (!p_kwrite)
+        p_kwrite     = se_sym("probe_kernel_write");
+    /* avc_denied 解析链。
+     *
+     * patch_config 是 kpimg 私有符号，KP 符号表（仅 KP_EXPORT）不可达
+     * → patch_config 链只作互证源；p_ksym_by_suffix 在预构建 kpimg 上
+     * 从未绑定（L3 保留代码路径，其他设备 KP 版本可能导出）。普通 L1
+     * kallsyms_lookup_name 对内核 static 符号可用（context_struct_
+     * compute_av.72 后缀枚举命中、avtab_insert_nonunique 直名命中），
+     * L1 错地址案例是数据符号（security_read_policy/selinux_state）。
+     * avc_denied 在 kallsyms 是无后缀裸名（kallsyms.txt + System.map
+     * 双证）。解析链：主源 se_sym("avc_denied")（L1 直名），patch_config
+     * 链降为互证源（可达即比对，不一致=0 拒挂）。最终正确性由 install
+     * 的入口格式校验兜底（KP 补丁 LDR/BR/quad hook.c:309-316 verbatim）。 */
+    {
+        unsigned long aden = se_sym("avc_denied");
+        unsigned long pc_sym = se_sym("patch_config");
+        unsigned long pc_ptr = 0, aden_pc = 0;
+
+        p_adenied = 0;
+        if (aden && ((aden >> 48u) == 0xffffu)) {
+            p_adenied = aden;
+            pr_info("sehide: avc_denied via kallsyms %016lx\n", aden);
+        }
+        if (pc_sym && se_kptr_ok(pc_sym) &&
+            !se_kread(&pc_ptr, (void *)pc_sym, 8) && se_kptr_ok(pc_ptr) &&
+            !se_kread(&aden_pc, (void *)(pc_ptr + 88u), 8) && se_kptr_ok(aden_pc) &&
+            ((aden_pc >> 48u) == 0xffffu)) {
+            if (!p_adenied) {
+                p_adenied = aden_pc;
+                pr_info("sehide: avc_denied via patch_config %016lx\n", aden_pc);
+            } else if (p_adenied != aden_pc) {
+                pr_info("sehide: adenied sources disagree %016lx vs %016lx, refuse\n",
+                        p_adenied, aden_pc);
+                p_adenied = 0;
+            }
+        }
+        if (!p_adenied)
+            pr_info("sehide: avc_denied unresolved via all paths\n");
+    }
+    /* KP replace 地址不走符号表（kpimg 私有符号不可达，装机实测），
+     * 由 install 从 avc_denied 入口的 KP 补丁内嵌 quad 反推
+     * （hook.c:309-316 格式 verbatim，内核形态校验）。 */
+    p_patch_text     = se_sym("aarch64_insn_patch_text");
+    p_ahp            = se_sym("avc_has_perm");
+
     p_pdb_destroy    = se_sym("policydb_destroy");
     p_kread          = se_sym("copy_from_kernel_nofault");
     if (!p_kread)
@@ -256,13 +428,12 @@ void se_bind_symbols(void)
     p_kthread_create_on_node = se_sym("kthread_create_on_node");
     p_wake_up_process        = se_sym("wake_up_process");
     p_kthread_should_stop    = se_sym("kthread_should_stop");
-    p_msleep_interruptible   = se_sym("msleep_interruptible");  /* v68：ss/hashtab.c 非静态，kallsyms T */
-    p_flex_prealloc  = se_sym("flex_array_prealloc");  /* v68：设备 kallsyms T 实证 */
-    p_flex_get       = se_sym("flex_array_get");       /* v68：同上 */
+    p_msleep_interruptible   = se_sym("msleep_interruptible");  /* ss/hashtab.c 非静态，kallsyms T */
+    p_flex_prealloc  = se_sym("flex_array_prealloc");  /* 设备 kallsyms T 实证 */
+    p_flex_get       = se_sym("flex_array_get");       /* 同上 */
     p_get_bit        = se_sym("ebitmap_get_bit");
     p_cred_getsecid  = se_sym("security_cred_getsecid");
     p_secctx_to_sid  = se_sym("security_secctx_to_secid");
-    p_str_to_ctx     = se_sym("string_to_context_struct");
     p_ctx_to_str     = se_sym("context_struct_to_string");
     p_compute_av     = se_sym("context_struct_compute_av");
     p_write_op       = se_sym("write_op");
@@ -287,6 +458,15 @@ void se_bind_symbols(void)
     if (!p_strncpy_user)
         p_strncpy_user = se_sym("strncpy_from_user");
     p_sidtab_to_sid  = se_sym("sidtab_context_to_sid");
+    /* 决策面副本查询的 sid→type 原语。4.19 sidtab_search 直返
+     * struct context *（sidtab.c:109，全局符号）；5.10+ 改名
+     * sidtab_search_entry 返回 entry（context 在 entry+8，sidtab.h:20-28
+     * verbatim）。两者都按 kallsyms T 绑定，调用方按 kver 选形。 */
+    p_sidtab_search  = se_sym("sidtab_search");
+    p_sidtab_entry   = se_sym("sidtab_search_entry");
+    /* 源 A 备用（se_perm_tab_build 内带 "security"/"process"
+     * 自证——本机 L1 对 D 段符号的错地址在此拦截）。 */
+    p_secclass_map   = se_sym("secclass_map");
     p_avtab_search   = se_sym("avtab_search");
     p_avtab_node_search = se_sym("avtab_search_node");
     p_avtab_add      = se_sym("avtab_insert_nonunique");
@@ -315,19 +495,20 @@ void se_bind_symbols(void)
     p_filp_open      = se_sym("filp_open");
     p_filp_close     = se_sym("filp_close");
     p_kernel_read    = se_sym("kernel_read");   /* 改①：批量规则文件读取 */
-    p_sel_read_status = se_sym("sel_read_handle_status");   /* v61：status 冻结 */
-    p_status_ops      = se_sym("sel_handle_status_ops");    /* v61：fops 数据符号 */
+    p_sel_read_status = se_sym("sel_read_handle_status");   /* status 冻结 */
+    p_status_ops      = se_sym("sel_handle_status_ops");    /* fops 数据符号 */
     p_kvfree         = se_sym("kvfree");
     if (!p_kvfree)
         p_kvfree     = p_kfree;
 
-    /* v54：影子页/坐标系重建所需的 kallsyms 可见符号。
+    /* 影子页/坐标系重建所需的 kallsyms 可见符号。
      * memstart_addr（memory.h:204 PHYS_OFFSET）、kimage_voffset（memory.h:210）、
      * swapper_pg_dir、_text 均为数据/代码符号，System.map d/T 段实证可见；
      * 4.19 上由 se_sym 运行期判定，绑不到则影子页子系统拒绝启用。 */
     p_sel_load_ops   = se_sym("sel_load_ops");
     p_vmalloc        = se_sym("vmalloc");
     p_vfree          = se_sym("vfree");
+    p_sel_open_policy = se_sym("sel_open_policy");
     p_stop_machine   = se_sym("stop_machine");
     p_gfp            = se_sym("__get_free_pages");
     p_memstart       = se_sym("memstart_addr");
@@ -339,12 +520,28 @@ void se_bind_symbols(void)
     p_kp_hook        = symbol_lookup_name("hook");
     p_kp_unhook      = symbol_lookup_name("unhook");
     p_kuid           = symbol_lookup_name("current_uid");
-    /* v81c：symbol_lookup_name 只搜 KP 自有符号表（base/symbol.c
+    /* KP 全表按名遍历 API（start.c:161 KP_EXPORT_SYMBOL，内部
+     * 已处理 6.1 的 nomod 签名）——D 段数据符号的可靠解析通道
+     * （L1 对 secclass_map 返回错地址，br_2317 scm rc=-3 实锤）。 */
+    p_ksym_each      = symbol_lookup_name("kallsyms_on_each_match_symbol");
+    /* 副本翻译表构建的内核函数（policydb.c 非 static 导出，
+     * policydb.h:387-388 extern；T 段——装机 kallsyms br_0618 verbatim 可见）。
+     * 语义（6.1 policydb.c:1809/1822 verbatim）：类名→cladatum->value、
+     * 权限名→1<<(perdatum->value-1)；第一参数=struct policydb *，传副本。 */
+    p_str2cls        = se_sym("string_to_security_class");
+    p_str2av         = se_sym("string_to_av_perm");
+    /* /policy 读门——副本序列化三件套（全部 T 段，装机 kallsyms
+     * br_0121 verbatim 可见：policydb_write/vmalloc_user/vfree）。 */
+    p_pdb_write      = se_sym("policydb_write");
+    p_vmalloc_user   = se_sym("vmalloc_user");
+    p_vfree          = se_sym("vfree");
+    p_sel_open_policy = se_sym("sel_open_policy");
+    /* symbol_lookup_name 只搜 KP 自有符号表（base/symbol.c
      * symbol_start..symbol_end），不搜内核 kallsyms——set_security_override
-     * 不在 KP 表（v81b 装机 symbol=0 实证）。改走 se_sym（内核
+     * 不在 KP 表（装机 symbol=0 实证）。改走 se_sym（内核
      * kallsyms_lookup_name -> kallsyms_on_each_symbol 回退链）。 */
     p_set_sec_override = se_sym("set_security_override");
-    /* v82：KP 的后缀解析器（KP_EXPORT_SYMBOL，KP 符号表必有）——
+    /* KP 的后缀解析器（KP_EXPORT_SYMBOL，KP 符号表必有）——
      * GKI 6.x 上 kallsyms_lookup_name 函数指针失效时的第三级回退 */
     p_ksym_by_suffix = symbol_lookup_name("kallsyms_lookup_name_by_suffix");
     pr_info("sehide: kp hook=%016lx unhook=%016lx current_uid=%016lx\n",

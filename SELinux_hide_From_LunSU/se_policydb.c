@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* se_policydb：规则原语与副本生命周期 - 自 v52 单文件纯搬移切分（sehide.h 为共享头） */
+/* se_policydb：规则原语与副本生命周期 */
 #include "sehide.h"
 
 /* ---------------- 写 live 的 permissive 位 ---------------- */
@@ -15,26 +15,21 @@ int se_set_permissive(void *policydb, se_u32 perm_off, se_u32 type)
         ((se_u8 *)policydb + perm_off, (se_ulong)type, 1);
 }
 
-/* ---------------- live len 维护（v88 根因修复） ----------------
+/* ---------------- live len 维护 ----------------
  *
  * 6.1 起 put_entry 带溢出检查（policydb.h:377：len > fp->len 返回
- * -EINVAL）；4.19 无检查（memcpy 撞过、fp.len 无符号递减、恒返回 0）。
- * apd 的 PostFsData 经 sel_open_policy → security_read_policy →
- * policydb_write 重序列化 live，输出缓冲上限 = policydb.len（加载时的
- * 原始 blob 长度，policydb_read 设置）。我们往 live 加的每条 avtab
- * 规则（重序列化 12B：u16×4 key + u32 datum，avtab_write_item）与首次
- * 置位的 permissive 位（ebitmap_write 空 4B → 1 节点 16B，+12B）都让
- * 重序列化变长 —— 超过 len 即 -EINVAL，apd 的 SePolicy::from_file
- * 失败，on_post_data_fs 的 `?` 直接退出（fp_br30：before 上报后 18ms
- * 内静默退出、零 load、零 crash、零 tombstone）。4.19 无检查所以装机
- * 从未暴露。
+ * -EINVAL）；4.19 无检查。apd 的 PostFsData 经 sel_open_policy →
+ * security_read_policy → policydb_write 重序列化 live，输出缓冲上限 =
+ * policydb.len（加载时的原始 blob 长度）。我们往 live 加的每条 avtab
+ * 规则（重序列化 12B）与首次置位的 permissive 位（+12B）都让重序列化
+ * 变长 —— 超过 len 即 -EINVAL，apd 的 SePolicy::from_file 失败、
+ * on_post_data_fs 静默退出。4.19 无检查所以不易暴露。
  *
  * 修复：live 侧每次有效写入同步把 policydb.len 增加对应增量，保证
  * policydb_write 的缓冲恒够；L.bin_len 同步（否则 len 指纹失配引发
  * recal 风暴）。apd 注入触发的真重载整体换代 live（len 由内核
- * policydb_read 重设），随后的 recal 重写三件套并再次维护 len —— 良性
- * 循环。副本由内核 policydb_read 构建、无人对副本 policydb_write，
- * len 无需维护。
+ * policydb_read 重设），随后的 recal 再次维护 len——良性循环。副本由
+ * 内核 policydb_read 构建、无人对副本 policydb_write，len 无需维护。
  */
 
 /* avtab = {htable 8B, nel 4B, nslot 4B, mask 4B}（4.19/6.1 同构），
@@ -63,79 +58,37 @@ static int se_len_grow(int bytes)
     return 0;
 }
 
-/* 幂等版 permissive：已置位不重写（ebitmap 无新节点、序列化不变长）。 */
-int se_set_permissive_once(void *pdb, se_u32 type, int *grown)
-{
-    int already = 0;
+/* se_set_permissive_once 已随三件套删除：live 恒出厂，permissive 位的
+ * 放行职责由决策面 outbound 翻转与副本 permissive 位承担。
+ * se_rules[] / se_apply_inbound_g / se_apply_trio / se_role_bits 同批删除。 */
 
-    if (!pdb || !L.perm || !type || !p_ebitmap_set)
-        return -1;
-    if (p_get_bit)
-        already = ((int (*)(void *, se_ulong))p_get_bit)
-            ((se_u8 *)pdb + L.perm, (se_ulong)type);
-    if (((int (*)(void *, se_ulong, int))p_ebitmap_set)
-        ((se_u8 *)pdb + L.perm, (se_ulong)type, 1))
-        return -1;
-    if (grown && !already)
-        *grown += 12;
-    return 0;
-}
-
-/*
- * 内容与 selinux/rules.c 的 apply_inbound_rules() 一致：只写"别的域 -> su"
- * 这一半。su 作为源那一半由 live 的 permissive 位和副本负责，不写进 live。
- */
-const struct se_rule se_rules[] = {
-    /* init：init 域内的早期进程操控/注入类组件（通用，LunSU inbound 同款） */
-    { "init", "process", 0, 0, 0, 0, 0 },
-    { "init", "dir", 0, 0, 0, 0, 0 },
-    { "init", "file", 0, 0, 0, 0, 0 },
-    { "init", "fd", 0, 0, 0, 0, 0 },
-    { "init", "fifo_file", 0, 0, 0, 0, 0 },
-    { "init", "unix_stream_socket", 0, 0, 0, 0, 0 },
-    { "init", "binder", 0, 0, 0, 0, 0 },
-    { "init", "memfd_file", 0, 0, 0, 0, 0 },
-    { "init", "chr_file", 0, 0, 0, 0, 0 },
-    { "init", "sock_file", 0, 0, 0, 0, 0 },
-    { "init", "lnk_file", 0, 0, 0, 0, 0 },
-    { "init", "debugfs", 0, 0, 0, 0, 0 },
-
-    { "servicemanager", "dir", "search", "read", 0, 0, 0 },
-    { "servicemanager", "file", "open", "read", 0, 0, 0 },
-    { "servicemanager", "process", "getattr", 0, 0, 0, 0 },
-
-    { "domain", "process", "sigchld", 0, 0, 0, 0 },
-    { "domain", "fd", "use", 0, 0, 0, 0 },
-    { "domain", "fifo_file", "write", "read", "open", "getattr", 0 },
-    { "domain", "unix_stream_socket", "read", "write", "connectto", "getopt", "getattr" },
-    { "domain", "memfd_file", "execute", "getattr", "map", "read", "write" },
-    { "domain", "binder", 0, 0, 0, 0, 0 },
-
-    { "logd", "dir", "search", 0, 0, 0, 0 },
-    { "logd", "file", "read", "open", "getattr", 0, 0 },
-
-    { "hwservicemanager", "dir", "search", 0, 0, 0, 0 },
-    { "hwservicemanager", "file", "read", "open", 0, 0, 0 },
-    { "hwservicemanager", "process", "getattr", 0, 0, 0, 0 },
-
-    { "system_server", "process", "getpgid", "sigkill", 0, 0, 0 },
-};
-
-#define NRULES (sizeof(se_rules) / sizeof(se_rules[0]))
+/* se_rules[]（inbound 26 条）已随三件套删除：ARCHITECTURE-LOCK §一
+ * "目标侧规则一加就能问出来"——live 里的 inbound 规则被非特权 oracle
+ * 直查可见。其放行职责由决策面 inbound 白名单六类翻转唯一承担。 */
 
 
 /*
  * 新增：type/class 查询的参数化版本 —— 在"给定的"policydb 上查名字。
- * se_type_val/se_class_val 保持原签名转调（live）。改①/改② 在副本上
- * 注入规则时必须用副本自己的 symtab（外部 blob 的 type 值可能不同于 live）。
+ * se_type_val/se_class_val 保持原签名转调（live）。副本注入规则时必须
+ * 用副本自己的 symtab（外部 blob 的 type 值可能不同于 live）。
  */
 /*
  * symtab 里按名字查 datum（原 L1296-1310 纯搬移，去 static）。
- *   5.9+   : symtab_search(&pdb->symtab[i], name)
- *   5.9 前 : hashtab_search(symtab[i].table, name)，4.x 的 table 是指针先解引用
+ *   v5.9+ : symtab_search(&pdb->symtab[i], name)
+ *   <5.9  : hashtab_search(symtab[i].table, name)，
+ *                          4.x 的 table 是指针，先解引用
+ * 分界取证：v5.8/hashtab.h:64 仍是 .c 里的 2 参真函数；
+ *           v5.9/hashtab.h:96 变成 .h 里的 3 参 static inline（kallsyms 无符号）。
+ * 这里保留「按符号存在性二选一」而不是版本号硬切：它属于符号解析而非
+ * ABI 形状分派，且能容忍 kallsyms 缺符号 / 厂商树的差异。
  */
 void *se_sym_search(void *sym, const char *name)
 {
+    /* 内核形态守卫：坏指针（如 build_copy 之前查未初始化的 L.copy）
+     * 会让内核 symtab_search 解引用 NULL+offset 直接 Oops 死机。
+     * 坏指针一律返回 0，调用方按 -2 fail-closed，绝不让坏指针进内核。 */
+    if (!sym || ((se_ulong)sym >> 48) != 0xffffull)
+        return 0;
     if (p_symtab_search)
         return (void *)((unsigned long (*)(void *, const char *))p_symtab_search)
             (sym, name);
@@ -191,7 +144,7 @@ int se_type_val(const char *name, se_u32 *out)
 
 int se_class_val(const char *name, se_u32 *out)
 {
-    /* v66：查出厂副本而非 live——live 上 LSP 新增的类（快照没有）返回
+    /* 查出厂副本而非 live——live 上 LSP 新增的类（快照没有）返回
      * -2，由门转成出厂同款 EINVAL；快照内类编号与快照 compute_av 自洽 */
     return se_class_val_at(L.copy, name, out);
 }
@@ -229,7 +182,7 @@ void se_free_perms(char **perms, se_u32 n)
 
 int se_perm_mask(const char *cls, const struct se_rule *r, se_u32 *out)
 {
-    void *first = (kver >= VERSION(5, 10, 0)) ? L.container : (void *)p_selinux_state;
+    void *first = (kver >= SE_KVER_510) ? L.container : (void *)p_selinux_state;
     char **perms = 0;
     se_u32 n = 0, i, mask = 0;
     int rc;
@@ -283,7 +236,7 @@ int se_perm_mask(const char *cls, const struct se_rule *r, se_u32 *out)
  */
 static int se_perm_mask_shared(const char *cls, const char **want, se_u32 nwant, se_u32 *out)
 {
-    void *first = (kver >= VERSION(5, 10, 0)) ? L.container : (void *)p_selinux_state;
+    void *first = (kver >= SE_KVER_510) ? L.container : (void *)p_selinux_state;
     char **perms = 0;
     se_u32 n = 0, i, mask = 0;
 
@@ -468,6 +421,60 @@ se_u32 se_sym_nprim(const se_u8 *pdb, se_u32 idx)
  */
 void *g_copy_prev;
 
+/* ==================== 特权读镜像（mirror） ====================
+ *
+ * 动机：副本序列化输出 > 4.69MB（pdb_write 写满 bin_len*2+1MB 缓冲后
+ * put_entry 缓冲耗尽 -EINVAL），膨胀源 = KPM 盖章的组合规则
+ * （outbound=组件域×attrs×ncls，回退分支 4096×107≈44 万条 avtab 节点）
+ * ——这些规则只为决策面收口查询服务，序列化给生态毫无意义且有害
+ * （apd 会把它们打包进下一个 blob 滚雪球）。
+ *
+ * 方案：在 policydb_read 成功后、盖章之前，序列化一份"干净镜像"
+ * （=出厂 + 全部生态规则，正是 apd 链式累积需要的内容）持久存档；
+ * 特权读 /policy 时直接给镜像（memcpy 到 vmalloc_user 块移交，内存
+ * 闭环与原版一致）。镜像换代 = 每次 absorb/build 时重捕获；捕获失败
+ * → 旧镜像作废（读门降级出厂，fail-closed）。镜像与副本解耦：副本
+ * 继续带盖章供决策面，镜像零盖章供生态——各取所需。
+ * ==================================================================== */
+void *g_rp_mirror;                      /* 镜像缓冲（vmalloc_user 持久块） */
+se_u32 g_rp_mirror_len;                 /* 镜像有效长度；0=无效 */
+
+static void se_mirror_capture(void *pdb)
+{
+    se_u64 sz, left = 0;
+    se_u8 pf[16];
+    void *nd;
+    long wrc;
+
+    g_rp_mirror_len = 0;
+    if (!pdb || !p_pdb_write || !p_vmalloc_user || !p_vfree)
+        return;
+
+    sz = (se_u64)L.bin_len * 2u + (1u << 20);
+    nd = (void *)((void *(*)(se_u64))p_vmalloc_user)(sz);
+    if (!nd)
+        return;
+    se_wr64(pf, (se_u64)(se_ulong)nd);
+    se_wr64(pf + 8, sz);
+    wrc = ((long (*)(void *, void *))p_pdb_write)(pdb, pf);
+    if (wrc) {
+        ((void (*)(void *))p_vfree)(nd);
+        pr_info("sehide: mirror capture rc=%ld\n", wrc);
+        return;
+    }
+    if (se_kread(&left, pf + 8, 8) || !left || left > sz) {
+        ((void (*)(void *))p_vfree)(nd);
+        pr_info("sehide: mirror cursor bad left=%llu\n", (se_u64)left);
+        return;
+    }
+    /* 成功：作废旧镜像，发布新镜像 */
+    if (g_rp_mirror)
+        ((void (*)(void *))p_vfree)(g_rp_mirror);
+    g_rp_mirror = nd;
+    g_rp_mirror_len = (se_u32)(sz - left);
+    pr_info("sehide: mirror captured (len=%u)\n", g_rp_mirror_len);
+}
+
 void se_retire_copy(void *fresh)
 {
     void *old = L.copy;
@@ -558,7 +565,7 @@ int se_stamp_rules(void *pdb)
     se_u32 n, c, i;
 
     /*
-     * v85：outbound 半边的盖章对象 = 生态组件域（g_comp_tname）。
+     * outbound 半边的盖章对象 = 生态组件域（g_comp_tname）。
      * KP 生态 = magisk（与切域/三件套同域，LunSU 语义逐条对齐——只是
      * 域对象随生态变）；查名失败回退 "su"（4.19 等旧生态，行为不变）。
      */
@@ -612,15 +619,8 @@ int se_stamp_rules(void *pdb)
  * 任何一次 set_bit 失败立即中止上报，绝不吞掉（对齐 LKM 同款纪律）。
  */
 /*
- * v56 根因修复（pstore 实证 20261101 elish Oops #1）：
- *
- * 旧实现 role_off = avtab_off - 24 直接消费 avtab 推导结果，自检仅查
- * "指针带内核前缀"。v54 改 2 后 avtab 由形态扫描给出（240，反解 248 被
- * 校验拒绝——两个推导器矛盾），role_off 指向错误位置，名字指针被当作
- * role_datum，rp+24 处垃圾被当作 ebitmap 传给内核 ebitmap_set_bit →
- * NULL deref Oops → init 崩 → 启动失败。
- *
- * 新定位：不依赖 avtab_off。独立扫描 policydb 头部区，寻找满足
+ * role 数组定位（独立于 avtab_off——avtab 推导结果不可直接消费）：
+ * 独立扫描 policydb 头部区，寻找满足
  * "连续 nroles 个指针且第 i 个 datum->value == i+1" 的偏移 ——
  * role 数组由 policydb_read 按序赋值（value=下标+1），错位必然不满足。
  * 找到后逐项写入，写前再对每个 rp 做同样形态校验。
@@ -641,70 +641,49 @@ static int role_pass(const se_u8 *pdb, se_u32 off, se_u32 nroles)
     return 0;
 }
 
-int se_role_bits(int value)
+/* se_role_bits 已随三件套删除（本机出厂已认 u:r:su:s0，role 条件位
+ * 从未写入；ARCHITECTURE-LOCK 2.4 的条件位语义在 KPM 无调用点）。 */
+
+/*
+ * build_copy 与 /load 吸收共用的"注入尾段"（inbound + permissive
+ * + 条件规则求值）。抽出仅为去重 —— se_absorb_blob 吸收生态 blob 时
+ * 需要同款后处理。
+ */
+static void se_stamp_copy_extras(void *buf, se_u32 comp_type)
 {
-    se_u32 i, nroles;
-    se_u32 off, role_off = 0;
-    se_u32 comp_type;
-    int rc;
+    /* inbound 半边盖章（特权 oracle 一致性）—— 与决策面 inbound 语义
+     * 等价：domain(全源)→comp域×白名单六类×全权；文件类刻意不放
+     * （mountinfo 泄露修复语义）。副本私有，非特权零接触。 */
+    if (se_decision_ready()) {
+        se_u32 dom = 0;
+        static const char *const ibn[6] = {
+            "process", "fd", "fifo_file", "unix_stream_socket",
+            "memfd_file", "binder",
+        };
 
-    if (!L.ok || !L.pdb || !L.su_type || !p_ebitmap_set)
-        return -1;
+        if (se_type_val_at(buf, "domain", &dom) == 0 && dom) {
+            se_u32 i;
 
-    /* v85：位写对象 = 生态组件域（与三件套其余两类一致） */
-    comp_type = g_comp_type ? g_comp_type : L.su_type;
+            for (i = 0; i < 6; i++) {
+                se_u32 cv = 0;
 
-    nroles = se_sym_nprim((const se_u8 *)L.pdb, 2u);
-    if (!nroles || nroles > 1024u)
-        return -1;
-
-    /* 独立定位 role 指针数组：不消费 avtab_off */
-    for (off = 16u; off + (se_u64)nroles * 8u <= SE_PDB_BUF; off += 8u) {
-        se_u64 p0 = 0;
-
-        if (se_kread(&p0, (se_u8 *)L.pdb + off, 8) || !se_kptr_ok(p0))
-            continue;
-        if (!role_pass((const se_u8 *)L.pdb, off, nroles))
-            role_off = off;
-    }
-    if (!role_off)
-        return -1;
-
-    for (i = 0; i < nroles; i++) {
-        se_u64 rp = 0;
-        se_u32 cur = 0;
-
-        if (se_kread(&rp, (se_u8 *)L.pdb + role_off + (se_u64)i * 8u, 8))
-            return -1;
-        if (!se_kptr_ok(rp))
-            continue;
-        /* 条件位：live 已接受（位已置）就不写，幂等且保持出厂态 */
-        if (p_get_bit &&
-            ((int (*)(void *, se_ulong))p_get_bit)
-                ((void *)(se_ulong)(rp + 24u), (se_ulong)(comp_type - 1u)) == value)
-            continue;
-        rc = ((int (*)(void *, se_ulong, int))p_ebitmap_set)
-            ((void *)(se_ulong)(rp + 24u), (se_ulong)(comp_type - 1u), value);
-        if (rc) {
-            pr_info("sehide: live role[%u] set_bit(%u) failed: %d\n",
-                    i, comp_type - 1u, rc);
-            return rc;
-        }
-        if (p_get_bit) {
-            cur = ((int (*)(void *, se_ulong))p_get_bit)
-                ((void *)(se_ulong)(rp + 24u), (se_ulong)(comp_type - 1u));
-            if ((int)cur != value) {
-                pr_info("sehide: live role[%u] self-check %u != %d\n",
-                        i, cur, value);
-                return -1;
+                if (se_class_val_at(buf, ibn[i], &cv) == 0 && cv)
+                    se_add_allow_at(buf, dom, comp_type, cv, 0xffffffffu);
             }
         }
     }
-    pr_info("sehide: live role bit %d for comp type %u over %u roles\n",
-            value, comp_type, nroles);
-    return 0;
-}
 
+    /* permissive 位（对象 = 生态组件域；live 零写入） */
+    if (comp_type && L.perm)
+        se_set_permissive(buf, L.perm, comp_type);
+    else if (L.su_type && L.perm)
+        se_set_permissive(buf, L.perm, L.su_type);
+
+    /* 对齐内核 security_load_policy 流程（services.c:3132
+     * policydb_read 之后调 evaluate_cond_nodes）。幂等防御性重评估。 */
+    if (p_eval_conds)
+        ((void (*)(void *))p_eval_conds)(buf);
+}
 
 /*
  * 建副本：policydb_read 到自有内存，注入后换代。
@@ -747,19 +726,20 @@ int se_build_copy(void)
     }
 
     /*
-     * v85：副本里给生态组件域开全类全权（g_comp_type：KP 生态=magisk，
-     * 旧生态=su；回退 L.su_type）。对齐 LunSU 语义——全权域 = 生态组件域，
-     * 机制不变，域对象随生态。对齐 LKM apply_ksu_rules 的
-     * ksu_allow(db, <comp>, ALL, ALL, ALL)。
+     * 副本里给生态组件域开全类全权（g_comp_type：KP 生态=magisk，
+     * 旧生态=su；回退 L.su_type）。全权域 = 生态组件域，对齐 LKM
+     * apply_ksu_rules 的 ksu_allow(db, <comp>, ALL, ALL, ALL)。
      * 类号 1..classes.nprim 连续（policydb_read 按序赋值），不查
      * sym_val_to_name —— 4.19 那张表是 `struct flex_array *`，不是
      * 5.10+ 的 `char **`（4.19 policydb.h:255 vs 6.1 :254），按下标读
      * 会读到 flex_array 自己的头。
      *
-     * permissive 位 v60 起由这里显式写入副本：live 不再先置位（live 零写入），
-     * 副本自查行为与旧版（继承 live）一致——副本是特权查询的答题主，
-     * permissive 语义保持不变。
+     * permissive 位由这里显式写入副本：live 不先置位（live 零写入），
+     * 副本是特权查询的答题主，permissive 语义保持不变。
      */
+    /* 镜像捕获（盖章前——出厂纯净态） */
+    se_mirror_capture(buf);
+
     if (L.su_type && p_avtab_add) {
         se_u32 comp_type = g_comp_type ? g_comp_type : L.su_type;
         se_u32 ncls = se_sym_nprim(buf, 1u);
@@ -785,139 +765,39 @@ int se_build_copy(void)
                 for (t = 1; t <= ntyp; t++)
                     se_add_allow_at(buf, comp_type, t, c, 0xffffffffu);
         }
-    }
 
-    /* v60/v85：副本显式置 permissive（对象 = 生态组件域） */
-    if (g_comp_type && L.perm)
-        se_set_permissive(buf, L.perm, g_comp_type);
-    else if (L.su_type && L.perm)
-        se_set_permissive(buf, L.perm, L.su_type);
+        /* inbound/permissive/cond 尾段抽为共用函数（与
+         * se_absorb_blob 同款，去重）。 */
+        se_stamp_copy_extras(buf, comp_type);
+    }   /* if (L.su_type && p_avtab_add) —— outbound/inbound 盖章作用域闭合 */
 
     /* 注入完成后才发布指针（对齐 LKM：apply 之后 se_copy = pol），再换代 */
     se_retire_copy(buf);
+
+    /* 副本换代后重建决策面翻译表（读新 L.copy 的 symtab——
+     * install/recal 全走本函数；blob 吸收换代不改类定义，无需重建）。 */
+    se_perm_tab_build();
     return 0;
 }
 
-int se_apply_inbound_g(se_u32 su, int *grown)
-{
-    se_u32 i, ok = 0, bad = 0, nel0, nel1;
+/* se_apply_inbound_g / se_apply_trio 已随三件套删除：live 恒出厂，
+ * inbound 26 条与 permissive 位的放行职责由决策面 inbound 白名单翻转与
+ * outbound 翻转唯一承担（见 se_decision.c 头注释）。recal 的决策就绪
+ * 分支不再写 live，仅刷新白名单（se_decision_recalibrate）。 */
 
-    nel0 = se_avtab_nel(L.pdb);
-
-    for (i = 0; i < NRULES; i++) {
-        const struct se_rule *r = &se_rules[i];
-        se_u32 src = 0, cls = 0, mask = 0;
-
-        if (se_type_val(r->src, &src))
-            goto skip;
-        if (se_class_val(r->cls, &cls))
-            goto skip;
-        if (se_perm_mask(r->cls, r, &mask))
-            goto skip;
-        if (se_add_allow_at(L.pdb, src, su, cls, mask))
-            goto skip;
-
-        ok++;
-        continue;
-skip:
-        bad++;
-    }
-
-    nel1 = se_avtab_nel(L.pdb);
-    /* 每条新增 avtab 节点重序列化 +12B（u16×4 key + u32 datum）；
-     * 命中已有节点的 OR 更新不加节点、不计增量。 */
-    if (grown)
-        *grown += (int)((nel1 - nel0) & 0xffffffffu) * 12;
-
-    L.rules_ok = ok;
-    L.rules_fail = bad;
-    pr_info("sehide: inbound ok=%u skip=%u nel=%u\n", ok, bad, L.avtab_nel);
-    return ok;
-}
 
 /*
- * live 三件套（v90 恢复，LunSU 形态定稿）：
- * live = 出厂 + 三件套（inbound 24 条 + permissive comp 位 + role 条件位）。
+ * ---------------- blob 吸收（副本内核构建，live 零手工） ----------------
  *
- * duck_detector 报告（fp_br31 同代）实证的失守点全部源于"生态注入落
- * live"：magisk/magisk_file/lsposed_file 类型可被 app_zygote 载体的
- * context oracle（EINVAL=不存在 / EACCES=存在）与 setprocattr oracle
- * 识别，policyload=5 可从 status 页读出，(untrusted_app→magisk:binder /
- * →lsposed_file:file read) access oracle = allowed —— 全部来自 /load
- * 放行后的真重载。恢复 /load 门（blob 全丢弃）后 live = 出厂 + 三件套，
- * 上述三项归零；su 是出厂类型，三件套的 flags/inbound 差异被 read_policy
- * 门挡在非特权可达面之外（LunSU selinuxfs.c:408/:470 注释同款论证）。
+ * 设计定论：往 live 的 policydb 手工注入类型并维护其派生表——在 KPM
+ * 约束下（无类型化符号，纯偏移考古）不可靠；「副本 = policydb_read(blob)
+ * + 盖章」由内核自建全部派生表/索引/一致性。live 类型注入自始多余：
+ * 本机模块文件全部用 stock 标签，LunSU 的 live 亦从不注入类型
+ * （borrowed names，type count 不变）。
  *
- * v88 的 len 维护保留：6.1 的 put_entry 溢出检查要求 live 的每次有效
- * 写入同步扩 policydb.len，否则 apd 读 /sys/fs/selinux/policy 时
- * policydb_write 返回 -EINVAL（fp_br30 根因）。
- */
-void se_apply_trio(se_u32 type)
-{
-    int grown = 0;
-    int rc;
-
-    if (!L.pdb || !type)
-        return;
-
-    se_apply_inbound_g(type, &grown);
-    rc = se_set_permissive_once(L.pdb, type, &grown);
-    if (rc)
-        pr_info("sehide: permissive bit failed rc=%d\n", rc);
-
-    if (grown > 0)
-        se_len_grow(grown);
-    pr_info("sehide: live trio type=%u ok=%u skip=%u len+%dB\n",
-            type, L.rules_ok, L.rules_fail, grown > 0 ? grown : 0);
-}
-
-/*
- * exec 进 su 域那一下。
- *
- * LKM 版是挂 bprm 钩子把「内核拒绝 + 新身份是 su」翻成允许。KPM 这版不用钩子，
- * 改成往 live 写一条 process:transition 允许规则 —— 内核自己的判定直接放行，
- * 与钩子等效，且是纯数据写（不用碰 static_call 跳转，也不用读 bprm 结构）。
- *
- * 依据：内核在 exec 时查 process:transition（源 = 调用方域），permissive 位只看源，
- * 答不了这一问；所以必须有一条 (src -> su, process, transition) 的 allow。
- */
-void se_allow_transition(se_u32 su)
-{
-    se_u32 cls = 0, mask = 0;
-    static const struct se_rule tr = { "domain", "process", "transition", 0, 0, 0, 0 };
-
-    if (se_class_val("process", &cls))
-        return;
-    if (se_perm_mask("process", &tr, &mask))
-        return;
-
-    /* 对 domain 属性本身写一条：(domain -> su, process, transition) */
-    {
-        se_u32 src = 0;
-
-        if (se_type_val("domain", &src))
-            return;
-        se_add_allow_at(L.pdb, src, su, cls, mask);
-        pr_info("sehide: transition rule domain->su mask=%08x\n", mask);
-    }
-}
-
-/*
- * ---------------- v78：blob 吸收（终版：副本内核构建，live 零手工） ----------------
- *
- * v62-v77 七轮装机证据的最终收敛：
- *   - 全部事故（v68 attr map、v70 解引用、v72/73/75 定位器、v76 strlen
- *     panic、v77 v2s 定位）同源：往 live 的 policydb 手工注入类型并维护
- *     其派生表——在 KPM 约束下（无类型化符号，纯偏移考古）不可靠；
- *   - v77 实证「副本 = policydb_read(blob) + su 盖章」一次成功且无 panic；
- *   - live 类型注入自始多余：本机模块文件全部用 stock 标签（fp_br9
- *     ap_tree 实证 system_file/adb_data_file），LunSU 的 live 亦从不注入
- *     类型（borrowed names，type count 不变）。
- *
- * 终版语义（LunSU 对齐，问题树不存在）：
- *   live  = 出厂 + su 三件套（inbound + permissive + role 位，仅 install
- *           时写入）——零类型注入、零派生表手工操作；
- *   copy  = policydb_read(blob) + su 盖章 + 换代（内核自建全部派生表/
+ * 终版语义：
+ *   live  = 出厂（零类型注入、零派生表手工操作）；
+ *   copy  = policydb_read(blob) + 盖章 + 换代（内核自建全部派生表/
  *           索引/一致性，含 type_val_to_struct_array——type_attribute_
  *           bounds_av 对其 BUG_ON(!slot) 不可缺席）；
  *   规则  = 只在 copy（特权查询视图），live 无模块规则。
@@ -925,21 +805,99 @@ void se_allow_transition(se_u32 su)
  * 失败 fail-closed：解析/盖章失败返回错误让组件重试，未换代即整块释放。
  */
 
+/*
+ * ---------------- blob 吸收落副本 ----------------
+ *
+ * blob 来源（源码 verbatim 闭合）：apd 的 magiskpolicy --live 产物 ——
+ *   event.rs:50-54 / module.rs:186-192 读 live → 加规则 →
+ *   sepolicy.rs:129 to_file("/sys/fs/selinux/load") = policydb 序列化
+ *   （完整 binary policy：出厂 + 生态规则）。
+ *
+ * 语义：policydb_read(blob) 到新副本（内核自建全部派生表）→ 类数校验
+ *   （map 翻译表有效性的前提：副本类定义必须与 live 一致，magiskpolicy
+ *   只加规则/类型不加类，不一致=异常提交物拒收）→ 盖章（outbound +
+ *   se_stamp_copy_extras）→ se_retire_copy 换代。生态规则自此经副本在
+ *   决策面收口查询生效。
+ *
+ * 失败安全：任何一步失败 → 丢弃 + 假成功（返回 0，写方永远认为成功）。
+ *   红线：reject 返回会让 apd post-fs-data 的 `?` 静默退出（zygisk
+ *   全灭）——失败降级=丢弃假成功，live/copy 零污染。
+ */
+
 int se_absorb_blob(const se_u8 *blob, se_u32 blen)
 {
-    /*
-     * v90：blob 全丢弃（假成功）。LunSU 形态 = live 与副本都保持
-     * "出厂 + 三件套"——blob（apd 的 magisk blob / 模块 sepolicy.rule
-     * 的编译产物）里的 magisk/lsp 类型与规则一旦进 live 或副本，就会被
-     * app_zygote 载体的 context oracle（EINVAL/EACCES 判别）、
-     * setprocattr oracle 与 access oracle 全部读出（duck_detector 实测
-     * 三项失守）。生态组件的生存由 KP task_ext 兜底 + 三件套承担
-     * （4.19 v84b /load 门在场全链实证），blob 内容无生存贡献，纯暴露。
-     * 模块自身的 sepolicy 批（KPM 控制面）与 LunSU handle_sepolicy 对等，
-     * 走 se_ctl 进副本，不经此路径。
-     */
-    (void)blob;
-    (void)blen;
-    pr_info("sehide: /load absorbed (blob dropped, live+copy untouched)\n");
+    se_u8 *buf;
+    se_u8 pf[16];
+    se_u32 magic = 0, ncls_blob = 0, ncls_live = 0;
+    se_u32 comp_type;
+    int rc;
+
+    if (!blob || !blen || blen > SE_MAX_BIN || !L.ok || !L.copy ||
+        !p_pdb_read)
+        return 0;   /* 未就绪：丢弃，假成功（门语义不变） */
+    if (blen < 16u)
+        goto drop;
+    magic = (se_u32)blob[0] | ((se_u32)blob[1] << 8u) |
+            ((se_u32)blob[2] << 16u) | ((se_u32)blob[3] << 24u);
+    if (magic != 0xf97cff8cu)   /* SELINUX_MAGIC（sepolicy_flags.h:13）；
+                                 * 文本/未知格式：非本引擎处理面，丢弃 */
+        goto drop;
+
+    buf = se_alloc(SE_PDB_BUF);
+    if (!buf)
+        goto drop;
+    memset(buf, 0, SE_PDB_BUF);
+    se_wr64(pf, (se_u64)(se_ulong)blob);
+    se_wr64(pf + 8, blen);
+    rc = ((int (*)(void *, void *))p_pdb_read)(buf, pf);
+    if (rc) {
+        static int ab_diag;
+
+        if (ab_diag < 3) {
+            ab_diag++;
+            pr_info("sehide: absorb pdb_read rc=%d len=%u\n", rc, blen);
+        }
+        se_free(buf);
+        goto drop;
+    }
+
+    ncls_blob = se_sym_nprim(buf, 1u);
+    /* 类数基准从 L.copy 取（自有内存，se_rd32 直接解引用安全；L.pdb 在
+     * 重载窗口可能被内核重建而悬空）。副本基底=出厂 live → 类数等价。 */
+    ncls_live = se_sym_nprim(L.copy, 1u);
+    if (!ncls_blob || ncls_blob != ncls_live) {
+        pr_info("sehide: absorb class mismatch blob=%u live=%u, dropped\n",
+                ncls_blob, ncls_live);
+        se_free(buf);
+        goto drop;
+    }
+
+    /* 镜像长度倒退保护：正常写 = 最新镜像 + 新规则，magiskpolicy 幂等
+     * 不缩 → 长度单调不减；严格倒退 ⇒ 旧读覆盖（writer 持旧读）会覆盖
+     * 已累积规则 → 丢弃假成功（生态无感）。等于=合法幂等，不丢。 */
+    if (g_rp_mirror_len && blen < g_rp_mirror_len) {
+        pr_info("sehide: /load stale blob dropped (len=%u < mirror=%u)\n",
+                blen, g_rp_mirror_len);
+        se_free(buf);
+        goto drop;
+    }
+
+    /* 镜像捕获（盖章前——出厂+本 blob 规则的累积态） */
+    se_mirror_capture(buf);
+
+    comp_type = g_comp_type ? g_comp_type : L.su_type;
+    if (se_stamp_rules(buf)) {
+        se_free(buf);
+        goto drop;
+    }
+    se_stamp_copy_extras(buf, comp_type);
+
+    se_retire_copy(buf);
+    pr_info("sehide: /load absorbed into copy (len=%u classes=%u)\n",
+            blen, ncls_blob);
+    return 0;
+
+drop:
+    pr_info("sehide: /load blob dropped (len=%u magic=%08x)\n", blen, magic);
     return 0;
 }

@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* se_bprm：exec 过渡钩子 - 自 v52 单文件纯搬移切分（sehide.h 为共享头） */
+/* se_bprm：exec 过渡钩子 */
 #include "sehide.h"
 
 
-/* ---------------- bprm 过渡钩子（与 LKM 版同一套逻辑） ---------------- */
+/* ---------------- bprm 过渡钩子 ---------------- */
 
 int (*g_orig_bprm)(void *bprm);
 se_u32 g_cred_off;
@@ -11,8 +11,8 @@ se_u32 g_lbs_cred;
 se_u32 g_su_sid;
 
 /*
- * v85：组件域（生态域）。默认 su（= v84b 及之前行为，4.19 等无 magisk
- * 生态的装机验证路径）；se_install_engine 标定到 magisk 时整体切换。
+ * 组件域（生态域）。默认 su（无 magisk 生态时的验证路径）；
+ * se_install_engine 标定到 magisk 时整体切换。
  * 定义在 se_bprm.c（与 g_su_sid 同处），声明在 sehide.h。
  */
 se_u32 g_comp_type;
@@ -21,28 +21,24 @@ const char *g_comp_ctx = "u:r:su:s0";
 const char *g_comp_tname = "su";
 
 int g_hook_done;
-int g_install_fails;   /* v54：延迟安装失败计数（进程上下文重试上限） */
+int g_install_fails;   /* 延迟安装失败计数（进程上下文重试上限） */
 
 /*
- * v81：组件域切轨（LunSU 组件生存模型的完整移植）。
+ * 组件域切轨（LunSU 组件生存模型的移植）。
  *
- * LunSU 生态里组件不需要 live 有任何模块规则也能活，因为 ksud 把组件
- * 进程授权进了 su 域：live 的 su 三件套（inbound 规则 + permissive 位）
- * 恰好覆盖 su 域的一切操作——源是 su 的 denial 由 permissive 位放行，
- * 目标是 su 对象的操作由 inbound 放行。live 本来就是为 su 域组件设计的
- * 生存空间，规则自始不必进 live。
- *
- * 本机（APatch/FolkPatch 生态）组件链（apd -> post-fs-data.sh ->
- * 各 daemon/注入器）实测全在 u:r:init:s0 域、无任何 KP 授权标记
- * （活体 ps -AZ + dmesg commit_common_su 全为事件自用实证）——组件的
- * 操作撞上 enforcing 的 live 就被真拒（dontaudit 静默）。
+ * LunSU 生态里组件不需要 live 有任何模块规则也能活：live 的 su 生存域
+ * 覆盖 su 域组件的一切操作。本机（APatch/FolkPatch 生态）组件链
+ * （apd -> post-fs-data.sh -> 各 daemon/注入器）全在 u:r:init:s0 域、
+ * 无任何 KP 授权标记——组件的操作撞上 enforcing 的 live 就被真拒
+ * （dontaudit 静默）。
  *
  * 修复：bprm 钩子对「uid==0 且 exec 文件位于 /data/adb/ 下」的 exec，
  * 在 selinux_bprm_set_creds 原函数返回后（bprm->cred 的 SELinux 域已
- * 定型）用内核原生 set_security_override 把 bprm->cred 的域改写为 su。
- * commit_creds 之后组件进程域 = u:r:su:s0，进入 LunSU 组件生存域。
+ * 定型）用内核原生 set_security_override 把 bprm->cred 的域改写为
+ * 组件域。commit_creds 之后组件进程进入组件生存域。
  *
- *   - live 零改动：放行完全由既有 su 三件套承担（LunSU 底线不动）；
+ *   - live 零改动：放行由决策面翻转承担（仅回退形态由三件套
+ *     承担，见 sehide_main.c 安装段注释）；
  *   - 通用：判定只看「root 的 exec 且文件在 /data/adb/ 下」，任何 root
  *     管理器生态的组件脚本/daemon/注入器全部命中，零个体适配；
  *   - 精确：系统服务 exec /system/bin/* 不命中，SELinux 对系统域的
@@ -232,7 +228,7 @@ se_u32 se_derive_cred_off(void *bprm)
 }
 
 /*
- * v81：bprm 内核字符串槽里是否出现 "/data/adb/" 前缀。
+ * bprm 内核字符串槽里是否出现 "/data/adb/" 前缀。
  *
  * 4.19 binfmts.h 布局（cred 之后）：unsafe(4)+per_clear(4)+argc(4)+envc(4)
  * = 16 字节，filename@cred+24，interp@cred+32；__randomize_layout 时布局
@@ -281,58 +277,44 @@ static int se_bprm_is_adb_bin(void *bprm)
 }
 
 /*
- * v85b：apd 自身排除切域。
- *
- * 装机对照实证（fp_br29 boot_737 vs boot_05:56 同设备）：05:56（无 KPM）
- * apd 由 init exec、KP commit_common_su 提权、域保持生态原生（init），随后
- * PostFsData 完整执行（sepolicy 注入 → 模块 rule → post-fs-data.sh →
- * remove update flag）→ zygiskd（zn-daemon64）注入 zygote → 全链活。
- * KPM 在场时 apd 被切进组件域后，在 KP package_config 加载成功之后、
- * PostFsData 事件之前静默消失（logcat 19:15:07.556 起全程覆盖、PostFsData
- * 零输出、无 crash 痕迹），生态的 sepolicy 注入随之消失 —— magisk 类型/
- * 规则集/transition 全部不进 live，组件与注入器失去生存面。
- *
- * apd 的域管理是 KP 生态自己的事（supercall 提权，不靠域），KPM 一律
- * 不碰：filename 槽精确等于 "/data/adb/apd"（13 字节 + NUL）即排除。
+ * apd 自身排除切域：apd 的域管理是 KP 生态自己的事（supercall 提权，
+ * 不靠域），KPM 一律不碰——apd 被切进组件域会静默消失、生态的 sepolicy
+ * 注入随之消失（magisk 类型/规则集/transition 全部不进 live，组件与
+ * 注入器失去生存面）。filename 槽精确等于 "/data/adb/apd"
+ * （13 字节 + NUL）即排除。
  */
 
 /*
- * v81：uid0 + /data/adb 组件 exec -> bprm->cred 域改写为 su。
+ * uid0 + /data/adb 组件 exec -> bprm->cred 域改写为组件域。
  * 在 orig（selinux_bprm_set_creds）返回后调用：此时 bprm->cred 的
  * security blob 已由 SELinux 填好，set_security_override 覆盖其 sid，
- * 随后的 commit_creds 让新进程以 u:r:su:s0 落地。
+ * 随后的 commit_creds 让新进程以组件域落地。
  */
-static int g_diag_n;   /* v81b：一次性诊断计数 */
+static int g_diag_n;   /* 一次性诊断计数 */
 
 /*
- * v86：组件域切轨（行为判定版）。
+ * 组件域切轨行为判定：对照 orig 前后的 cred sid——
+ *   orig 目标域 != 调用者域  →  生态已安排 transition（任何目标域）
+ *   → 透传不覆盖，组件域写入值跟随观察值；
+ *   orig 目标域 == 调用者域  →  生态未安排 → 切组件域。
  *
- * 判定改为对照 orig 前后的 cred sid：
- *   orig 目标域 != 调用者域  →  生态已安排 transition（KP 注入后的
- *   magisk 域等任何目标域）→ 透传不覆盖，组件域写入值跟随观察值；
- *   orig 目标域 == 调用者域  →  生态未安排 → 切组件域（4.19 现状路径）。
+ * 零命名依赖：不查 "magisk" 字符串——任何生态、任何目标域自动跟随，
+ * 判定依据是生态行为（transition 有无），不是生态的类型命名。
  *
- * 零命名依赖：不再查 "magisk" 字符串——任何生态、任何目标域自动跟随，
- * 这是"一定范围内的通用兼容"：判定依据是生态行为（transition 有无），
- * 不是生态的类型命名。
- *
- * 依据（6.1.157 本地树实证）：security_cred_getsecid 为 EXPORT_SYMBOL
+ * 依据（6.1.157 本地树源码）：security_cred_getsecid 为 EXPORT_SYMBOL
  * （security.c:1754，内部 cred_getsecid 钩子 = cred_sid()）；bprm->cred
  * 在 orig 前由 prepare_creds 复制调用者 cred（其 security blob = 调用者
  * 域副本），orig 之后为 transition 计算结果（hooks.c bprm_creds_for_exec）。
  * 前后各一次 getsecid 即得调用者域与生态目标域，零新增符号。
  */
 /*
- * v90：组件域切轨回归 v84b 装机验证形态（uid0 + /data/adb -> comp 域）。
+ * 组件域切轨（uid0 + /data/adb -> comp 域）。
  *
- * /load 门恢复后 live = 出厂 + 三件套，magisk/lsp 类型不在 live —— 生态
- * 的 su -Z magisk（KP 裸 sid）覆盖为 su（出厂类型，permissive 三件套），
- * 组件在 su 域存活（4.19 v84b 全链实证：apd/模块脚本/zygiskd 同形态活）。
- * su 域是出厂类型，检测器的 context oracle / setprocattr oracle 对它
- * 求值 = 出厂行为，无新增可观测差异。
- *
- * v86 的行为判定与 v87 的关闭开关（区分实验已完成：apd 死因 = 6.1
- * put_entry 溢出，v88 len 维护修复）整体退役。
+ * live 恒出厂，magisk/lsp 类型不在 live —— 生态的 su -Z magisk
+ * （KP 裸 sid）覆盖为 su（出厂类型），组件在 su 域存活。su 域是出厂
+ * 类型，检测器的 context oracle / setprocattr oracle 对它求值 = 出厂
+ * 行为，无新增可观测差异；su 域内的真实放行由决策面翻转承担，不落
+ * live。
  */
 static void se_switch_to_su(void *bprm)
 {
@@ -385,15 +367,13 @@ int se_bprm_wrap(void *bprm)
         return -1;
 
     /*
-     * v60：钩子唯一职责 = 首触安装触发器 + 纯透传。
+     * 钩子唯一职责 = 首触安装触发器 + 纯透传。
      *
-     * v53 时代这里做"orig 拒绝后判定 cred 是 su 则强制放行"，配合 live 的
-     * domain->su transition 规则工作。v60 起 root 全部走 KP 核心 supercall
-     * （commit_common_su，本机日志 rc=0 实证）+ avc_denied 兜底，不依赖
-     * bprm 放行，也绝不写 live 规则 —— su 判定逻辑整体退役，exec 热路径
-     * 上只剩透传。
+     * root 全部走 KP 核心 supercall + 决策面兜底，不依赖 bprm 放行，
+     * 也绝不写 live 规则 —— su 判定逻辑已退役，exec 热路径上只剩
+     * 透传。
      *
-     * 首触安装机制保留（v54 设计）：event 上下文持 RCU 读锁不能睡眠，
+     * 首触安装机制：event 上下文持 RCU 读锁不能睡眠，
      * 引擎主体（policydb_read/se_alloc）延到策略就绪后的第一个 exec，
      * 在真进程上下文里跑；连续失败 3 次封顶（四铁律 R4）。
      */
@@ -416,8 +396,18 @@ int se_bprm_wrap(void *bprm)
      * live 重载（KP 6.5s / 模块 /load）后副本换代自愈：指纹三读三比，
      * 变了才重标定，未变零开销。
      */
-    if (!se_live_ok())
+    /* 决策面（RCU 读临界区）只置旗，exec 点（进程上下文）
+     * 代跑——自愈晚一个周期。 */
+    if (g_recal_pending) {
+        g_recal_pending = 0;
         se_recalibrate();
+    } else if (!se_live_ok()) {
+        se_recalibrate();
+    }
+    if (g_comp_pending) {
+        g_comp_pending = 0;
+        se_comp_upgrade();
+    }
 
     {
         int rc;
@@ -427,16 +417,16 @@ int se_bprm_wrap(void *bprm)
             if (!g_cred_off) {
                 if (g_diag_n < 4) {
                     g_diag_n++;
-                    pr_info("sehide: v81 cred off derive failed (uid0)\n");
+                    pr_info("sehide: cred off derive failed (uid0)\n");
                 }
                 return g_orig_bprm(bprm);   /* 标定失败：透传，下次重试 */
             }
             g_diag_n = 4;
-            pr_info("sehide: v81 cred off=%u\n", g_cred_off);
+            pr_info("sehide: cred off=%u\n", g_cred_off);
         }
         rc = g_orig_bprm(bprm);
 
-        /* v90：orig 后组件域切轨（v84b 装机形态）；引擎未就绪/降级
+        /* orig 后组件域切轨；引擎未就绪/降级
          * 路径直接透传 */
         if (!g_degraded && L.ok)
             se_switch_to_su(bprm);
@@ -445,7 +435,7 @@ int se_bprm_wrap(void *bprm)
 }
 
 /*
- * v60：卸载还原。在 security_hook_heads 链表里找仍指向 se_bprm_wrap 的槽，
+ * 卸载还原。在 security_hook_heads 链表里找仍指向 se_bprm_wrap 的槽，
  * 写回原函数（与安装同一 SE_FPHOOK 通道，回读验证）。幂等。
  * 影子页路径的还原由 se_shadow_remove_all() 负责（exit 先调它）。
  */
@@ -512,19 +502,18 @@ int se_find_fn_field(se_u64 base, se_u64 target, se_u32 *off_out)
 }
 
 /*
- * v54：event 期原子安装（原 se_install_hook）。
+ * event 期原子安装。
  *
  * 只保留数据面路径：
  *   ≤6.11  security_hook_heads 数据槽（fp_hook，实测存活）；
  *   6.12+  静态调用分发不经 security_hook_heads —— 原 __static_call_update
- *          路径是 text_poke 写指令（MKP 设备必死，v12 实证），整支删除；
+ *          路径是 text_poke 写指令（MKP 设备必死），整支删除；
  *          改用影子页改函数入口，对 static_call/直调全体调用方等效且
  *          不写任何内核指令。
  * KPM_EVENT 持 rcu_read_lock（module.c:691-704），本函数只做 fp_hook 数据槽
  * 写（hotpatch_nosync 原子序列，无 grace 等待）与影子页 stop_machine ——
- * 均不睡眠等待 grace，4.19 经典 RCU 读段内无自死锁面（对照 v44 的
- * synchronize_rcu 卡死）。
- */
+ * 均不睡眠等待 grace，RCU 读段内无自死锁面（synchronize_rcu 卡死红线
+ * 见 sehide_main.c）。 */
 int se_install_hook_early(void)
 {
     void *bak = 0;

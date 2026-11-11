@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* se_util：格式化/字节序/内存/字符串底座 - 自 v52 单文件纯搬移切分（sehide.h 为共享头） */
+/* se_util：格式化/字节序/内存/字符串底座 */
 #include "sehide.h"
 
 /* ---- 极简格式化：只做十进制/定宽十六进制/字符串，不依赖 snprintf ---- */
@@ -106,13 +106,25 @@ void se_free(void *p)
         ((void (*)(const void *))p_kvfree)(p);
 }
 
+/* 无形状分界：4.19 uaccess.h:242/265 的 probe_kernel_read/write 与
+ * v5.8 起的 copy_from_kernel_nofault/copy_to_kernel_nofault
+ * （v5.8 uaccess.h:306-307、6.1 :352-353、6.6 :374-375）返回类型
+ * 全部是 long，成功同为 0。AArch64 上按 x0 判 0 完全一致，
+ * 旧的 5.8 版本分支两臂行为相同，直接去掉。 */
 int se_kread(void *dst, const void *src, se_ulong n)
 {
     if (!p_kread)
         return -1;
-    if (kver >= VERSION(5, 8, 0))
-        return ((long (*)(void *, const void *, se_ulong))p_kread)(dst, src, n) == 0 ? 0 : -1;
-    return ((int (*)(void *, const void *, se_ulong))p_kread)(dst, src, n) == 0 ? 0 : -1;
+    return ((long (*)(void *, const void *, se_ulong))p_kread)
+           (dst, src, n) == 0 ? 0 : -1;
+}
+
+int se_kwrite(void *dst, const void *src, se_ulong n)
+{
+    if (!p_kwrite)
+        return -1;
+    return ((long (*)(void *, const void *, se_ulong))p_kwrite)
+           (dst, src, n) == 0 ? 0 : -1;
 }
 
 /*
@@ -171,3 +183,4 @@ int se_parse3(char *buf, char **a, char **b, char **c)
     }
     return 0;
 }
+

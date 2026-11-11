@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* se_layout：标定与结构推导 - 自 v52 单文件纯搬移切分（sehide.h 为共享头） */
+/* se_layout：标定与结构推导 */
 #include "sehide.h"
 
 /* 标定结果实例（struct 定义在 sehide.h） */
@@ -27,7 +27,7 @@ int se_read_policy(void **out, se_ulong *out_len)
      * 调两参函数，state 指针会被函数当作 data 出参 → `*len` 写坏
      * selinux_state 头 8B → Oops（内存破坏级）。
      */
-    if (kver >= VERSION(6, 4, 0)) {
+    if (kver >= SE_KVER_64) {
         rc = ((int (*)(void **, se_ulong *))p_read_policy)(out, out_len);
     } else {
         state = (void *)p_selinux_state;
@@ -37,7 +37,7 @@ int se_read_policy(void **out, se_ulong *out_len)
     }
 
     if (rc) {
-        /* v84：一次性失败诊断 —— container 活性与 slot10 现值。
+        /* 一次性失败诊断 —— container 活性与 slot10 现值。
          * c0=container 首 8B（5.10+ 为 sidtab*）；sN=state 第 slot 字段现值，
          * 与 calib 时的 container 对照可判定 state->policy 是否被换代/清空。 */
         se_u64 c0 = 0, s10 = 0;
@@ -397,8 +397,19 @@ int se_locate(void)
 /* ---------------- su 的 type ---------------- */
 
 /*
- * string_to_context_struct 会原地把 ':' 改成 '\0'，所以必须传可写副本。
- * 它把结果填进 struct context，前四个 u32 是 user/role/type/len（4.19~6.18 同）。
+ * 装机期上下文解析为内核委托。
+ *
+ * string_to_context_struct 是依赖面里唯一「同版本号两种形状」的函数
+ * （官方 4.19 全族六参；Android common 把 v4.20 的删参改动带进了 4.19，
+ * 4.19.157 实机按六参递参即 Oops，见 KPM-4.19实机启动失败日志分析）。
+ * 不再直调：security_secctx_to_secid(secdata, seclen, &sid) 三参，
+ * 4.19~6.18 函数体 md5 全同（shape_report），内核在
+ * security_context_to_sid_core 里用它自己编译的形状调 stc
+ * （小米 4.19 services.c:1534）——「几参」问题随直调一起消失。
+ * 内核自拷贝串（core 里 kmemdup），不改写调用者内存，传只读串即可。
+ * 失败原样返回 rc：装机路径引擎关（main:80-83）、recal 路径沿用原语义，
+ * 无兜底、无第二取数路径。前置条件只有 L.sidtab（se_locate 无条件赋值，
+ * se_calibrate 先于本函数；旧实现还要求 L.pdb，委托反而更少）。
  */
 /* su 的完整 context，探针拿它当 compute_av 的入参，避免用零填充的假 context */
 se_u8 g_su_ctx[SE_CTX_BUF];
@@ -406,29 +417,51 @@ int g_su_ctx_ok;
 
 int se_ctx_type(const char *s, se_u32 *type_out)
 {
-    char buf[64];
-    se_u8 ctx[SE_CTX_BUF];
-    se_ulong n = strlen(s);
+    se_u32 sid = 0, type = 0;
+    se_u64 cptr = 0;
     int rc;
 
-    if (!p_str_to_ctx || n >= sizeof(buf))
+    if (!p_secctx_to_sid || !L.sidtab)
         return -1;
 
-    memcpy(buf, s, n + 1);
-    memset(ctx, 0, sizeof(ctx));
-
-    /*
-     * (pol, sidtab, scontext, ctx, def_sid) —— 全版本五参，理由见渲染器那段注释。
-     * 这里就是 4.19 上把 x3(len=9) 当 ctx 崩掉 memset(0x9,0,0x50) 的地方。
-     */
-    rc = ((int (*)(void *, void *, char *, void *, se_u32))p_str_to_ctx)
-        (L.pdb, L.sidtab, buf, ctx, SECSID_NULL);
-
+    rc = ((int (*)(const char *, se_u32, se_u32 *))p_secctx_to_sid)
+         (s, (se_u32)strlen(s), &sid);
     if (rc)
         return rc;
+    if (!sid)
+        return -2;
 
-    *type_out = se_rd32(ctx + 8);   /* struct context { u32 user, role, type, len; ... } */
-    memcpy(g_su_ctx, ctx, SE_CTX_BUF);
+    /* sid -> type，按符号存在性分派（两符号互斥，4.19/6.1 实机 kallsyms
+     * 实证；与决策面 se_decision.c 同款读法）：
+     *   5.6+  sidtab_search_entry -> struct sidtab_entry{u32 sid; u32 hash;
+     *         struct context ctx;}                type@entry+16
+     *   <=5.5 sidtab_search -> struct context *    type@ctx+8 */
+    if (p_sidtab_entry) {
+        se_u64 entry = ((se_u64(*)(void *, se_u32))p_sidtab_entry)(L.sidtab, sid);
+
+        if (!entry || !se_kptr_ok(entry) ||
+            se_kread(&type, (void *)(se_ulong)(entry + 16u), 4))
+            return -3;
+        cptr = entry + 8u;      /* struct context 起始 */
+    } else if (p_sidtab_search) {
+        cptr = ((se_u64(*)(void *, se_u32))p_sidtab_search)(L.sidtab, sid);
+
+        if (!cptr || !se_kptr_ok(cptr) ||
+            se_kread(&type, (void *)(se_ulong)cptr + 8u, 4))
+            return -4;
+    } else {
+        return -5;
+    }
+    if (!type)
+        return -6;
+
+    *type_out = type;
+    /* context 从内核原位拷回（内核按自己布局读，与旧 stc 写入同布局）。
+     * 先清零保住旧实现的零尾巴；拷 96B —— struct context 最大 80B
+     * （小米树多 u32 hash），4.19~6.18 均覆盖。 */
+    memset(g_su_ctx, 0, SE_CTX_BUF);
+    if (se_kread(g_su_ctx, (void *)(se_ulong)cptr, 96u))
+        return -7;
     g_su_ctx_ok = 1;
     return 0;
 }
@@ -650,8 +683,10 @@ int se_scan_avtab(const se_u8 *copy)
  *   -> class/role/user/type_val_to_struct（4 个指针）-> te_avtab
  * 合计 12 个 8 字节 = 96，顺序在 4.19~6.18 一致（4.19 policydb.h:239-264）。
  * 所以 base = avtab_off - 96 - sym_num*stride，stride 由 hashtab 形态决定：
- *   4.x  : symtab{ struct hashtab *table; u32 nprim; }   nprim@+8 , stride 16
- *   5.4+ : symtab{ struct hashtab  table; u32 nprim; }   nprim@+16, stride 24
+ *   <=5.7: symtab{ struct hashtab *table; u32 nprim; }   nprim@+8 , stride 16
+ *   >=5.8: symtab{ struct hashtab  table; u32 nprim; }   nprim@+16, stride 24
+ *   （分界 v5.8：v5.7/symtab.h 仍是指针，v5.8/symtab.h 已内嵌；
+ *     旧注写 5.4+ 有误。strides[] 运行期枚举不受影响。）
  * 判据只要求"每个 symtab 的首字段是内核指针、nprim 合理"，不再比对二进制。
  */
 int se_symtab_from_avtab(const se_u8 *copy)
@@ -675,7 +710,7 @@ int se_symtab_from_avtab(const se_u8 *copy)
             se_u32 nprim = se_rd32(copy + base + i * stride + stride - 8u);
 
             /*
-             * v83：htable 允许 NULL。6.1 GKI 实证（fp_br21 dump）：
+             * htable 允许 NULL。6.1 GKI 实证：
              * levels 表 htable=NULL（空表）位于 stride=24 网格中间，
              * 旧判据"每表首字段必须 0xffff 指针"在它身上 break，
              * 把正确的 stride=24/base=16 整个否掉 -> derive miss ->
@@ -779,11 +814,11 @@ int se_derive_layout(void)
     }
 
     /*
-     * 推导顺序（v56 恢复 v53 实测全绿顺序）：
-     * 1) inline hook 探针（内核自己交出 avtab 地址，最可靠——v53 在 4.19
-     *    实测全绿的路径）。代价是装机早期写一次 .text：MKP/写保护机型
-     *    当场死（v12 实证）——v55 的 pstore 崩溃证明下游 role_bits/inbound
-     *    消费扫描值的风险远高于探针：错位值骗过不变式校验后写坏 live。
+     * 推导顺序：
+     * 1) inline hook 探针（内核自己交出 avtab 地址，最可靠——实测
+     *    全绿的路径）。代价是装机早期写一次 .text：MKP/写保护机型
+     *    当场死（text 写必死红线）——pstore 崩溃证明下游直接消费
+     *    扫描值的风险远高于探针：错位值骗过不变式校验后写坏 live。
      *    非 MKP 机型（4.19 vendor 全系）走此路径；MKP 机的安全探针另案。
      * 2) 反解（纯读）：探针不可用时。
      * 3) 形态扫描（纯读）：最后兜底。

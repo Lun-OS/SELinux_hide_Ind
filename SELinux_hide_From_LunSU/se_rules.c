@@ -13,7 +13,7 @@
  *     支持  NORMAL_PERM allow/deny、TYPE_STATE permissive/enforce
  *     拒绝  XPERM/TYPE/TYPE_ATTR/ATTR/TYPE_TRANSITION/TYPE_CHANGE/GENFSCON
  *           （返回 -EOPNOTSUPP，各打一条日志）
- *   引擎自身的域建立不依赖这些命令（v23 路线：su 域出厂已存在），
+ *   引擎自身的域建立不依赖这些命令（su 域出厂已存在），
  *   子集覆盖模块规则的真实使用面；LKM 侧命令集保持全量不变。
  */
 #include "sehide.h"

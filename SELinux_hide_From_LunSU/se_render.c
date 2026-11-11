@@ -1,23 +1,21 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* se_render：渲染三路 + 自检 - 自 v52 单文件纯搬移切分（sehide.h 为共享头） */
+/* se_render：渲染三路 + 自检 */
 #include "sehide.h"
 
 /* ---------------- 渲染器（自建三路） ---------------- */
 
 /*
- * 一路：上下文串 -> SID
- *   string_to_context_struct(pol, sidtab, str, &ctx, def_sid)   —— 五参，全版本
- *   sidtab_context_to_sid(sidtab, &ctx, &sid)
- *
- * 参数个数不能按主版本号判：
- *   主线 v4.19.157 services.c:1366-1370 还是六参（多一个 scontext_len），
+ * 一路：上下文串 -> SID（自实现 se_parse_ctx，不经内核直调）
+ *   （历史注：string_to_context_struct 的参数个数不能按主版本号判——
+ *   主线 v4.19.157 services.c:1366-1370 是六参（多一个 scontext_len），
  *   但 Android/vendor 分支早已 backport 掉它 —— 本机 elish 4.19.113 树
  *   services.c:1376-1380 就是五参，v5.4 起主线也统一五参
  *   （v5.4 :1375-1378 / v5.10 :1424-1427 / v6.1 :1437-1440 /
  *     v6.6 :1416-1419 / v6.12 :1426-1429 / v6.18 :1475-1478）。
- * 本机 4.19.157 现场实测也是五参：按六参调用时内核把 x3（我们传的 len=9）
+ *   4.19.157 实机按六参调用时内核把 x3（我们传的 len=9）
  *   当成 ctx，context_init() 里 memset(0x9, 0, 0x50) 直接 Oops。
- * 所以这里不再分版本，一律五参。
+ *   装机期解析统一改 secctx 委托（不直调 stc），
+ *   见 se_layout.c se_ctx_type。）
  *
  * 二路：SID -> 上下文串
  *   sidtab_search_entry(sidtab, sid) -> struct sidtab_entry *（5.10+）
@@ -33,7 +31,7 @@
  */
 
 /*
- * v55：渲染三路改为副本侧自实现，不再绑定/调用 static 函数
+ * 渲染三路为副本侧自实现，不绑定/调用内核 static 函数
  * string_to_context_struct —— 它在主线 4.19 是六参、vendor 4.19 与
  * 5.10+ 是五参（四树源码实证），参数个数无法在 KPM 环境安全判别，
  * 写死五参在主线 4.19 上 context_init 对空指针 memset 直接 Oops。
@@ -148,7 +146,7 @@ static int seg_val(void *pdb, se_u32 idx, const char *seg, se_u32 *out)
 }
 
 #define SE_SYM_USER 4u   /* policydb.h:220 SYM_USERS=4（4.19/6.1 同）；
-                            v56 误写 0（那是 SYM_COMMONS），su 段永远查空 → rc=-2 */
+                            （曾误写 0=SYM_COMMONS），su 段永远查空 → rc=-2 */
 #define SE_SYM_ROLE 2u
 #define SE_SYM_TYPE 3u
 #define SE_STR_MLS  -95    /* MLS 段：自实现不支持（mls 关闭路径自证） */
@@ -158,7 +156,7 @@ static int seg_val(void *pdb, se_u32 idx, const char *seg, se_u32 *out)
  *
  * 按 ':' 切段。SELinux 串恒为 user:role:type[:mls]：第 4 段是 MLS 敏感度，
  * mls 关闭的内核解析它时直接跳过（4.19 mls.c:250 *scontext += strlen 分支）
- * ——所以 "u:r:su:s0" 是 4 段且必须接受、忽略第 4 段（v55 在此误拒，
+ * ——所以 "u:r:su:s0" 是 4 段且必须接受、忽略第 4 段（曾在此误拒，
  * selftest rc=-95、su sid 兜底解析失败）。≥5 段才是真正异常。
  * 原地改写 buf 与内核原版契约一致。
  */
@@ -185,8 +183,17 @@ int se_parse_ctx(char *buf, void *ctxbuf)
     }
     if (n < 3)
         return -2;
-    if (n > 4)
-        return SE_STR_MLS;   /* 5 段以上：结构异常 */
+    /*
+     * 5 段 = MLS 形态 "u:r:type:sens:cats"（真实 app 域全部带
+     * 类别，如 u:r:platform_app:s0:c512,c768）。此前一律拒绝（-SE_STR_MLS）
+     * 导致带类别的特权查询恒 -22（SystemUI 等 attach 循环崩的直接机制，
+     * 实测 T2 wr=1 / T3 无 MLS 版 wr=0 复现）。MLS 段跳过：range 置零
+     * （parse 开头已 memset），求值走 type（Android app 边几乎不含
+     * mlsconstrain，实测 T3 副本答案 allow 与出厂一致）；MLS 精确
+     * 填充（sens symtab + cat ebitmap）留待实测需要时再做。
+     */
+    if (n > 5)
+        return SE_STR_MLS;   /* 6 段以上：结构异常 */
 
     for (i = 0; i < 3; i++) {
         se_u32 v = 0;
@@ -320,7 +327,7 @@ se_u32 g_avd[8];
  * 副本是开机时拷的，之后不再变，恒 0 与"策略没有再次加载"是同一语义。
  */
 int se_compute_av(void *sctx, void *tctx, se_u32 tclass,
-                         se_u32 *allowed, se_u32 *flags)
+                         se_u32 *allowed, se_u32 *flags, se_u32 *avd5)
 {
     se_u8 avd[SE_AVD_BUF];
     se_u32 sctype;
@@ -339,10 +346,12 @@ int se_compute_av(void *sctx, void *tctx, se_u32 tclass,
         se_wr32(avd + 16, se_rd32(avd + 16) | 0x1u);   /* AVD_FLAGS_PERMISSIVE */
 
     /*
-     * 6.18 在 permissive_map 和 len 之间多了一个 neveraudit_map，两位都命中
-     * 时直接全通（services.c:1158-1161）。判断"有没有这个字段"不用版本号：
-     * 标定已经量出 perm 与 len 的偏移，间距 32 说明中间夹了一个 ebitmap
-     * （ebitmap 恒 16 字节），间距 16 就是没有。
+     * v6.17 起（不是 6.18）在 permissive_map 和 len 之间多了
+     * neveraudit_map（v6.17/v6.18 policydb.h:303，v6.12 无），两位都命中
+     * 时直接全通（services.c:1158-1161）。
+     * 这里用的是 se_calibrate() 实测的数据布局间距，不是函数形状分派：
+     * 静态版本表只管调用 ABI，数据布局仍以实测为准，
+     * 避免厂商回移版本号骗过判据。间距 32 = 中间多一个 ebitmap(16B)。
      */
     if (p_get_bit && L.perm && L.lenoff == L.perm + 32u &&
         ((int (*)(void *, se_ulong))p_get_bit)
@@ -362,6 +371,13 @@ int se_compute_av(void *sctx, void *tctx, se_u32 tclass,
                 *allowed = g_avd[0];
             if (flags)
                 *flags = g_avd[4];
+            if (avd5) {   /* 栈上出参（门并发防 g_avd 竞态） */
+                avd5[0] = g_avd[0];
+                avd5[1] = g_avd[1];
+                avd5[2] = g_avd[2];
+                avd5[3] = g_avd[3];
+                avd5[4] = g_avd[4];
+            }
             return 0;
         }
     }
@@ -379,6 +395,13 @@ int se_compute_av(void *sctx, void *tctx, se_u32 tclass,
         *allowed = g_avd[0];
     if (flags)
         *flags = g_avd[4];
+    if (avd5) {   /* 栈上出参（门并发防 g_avd 竞态） */
+        avd5[0] = g_avd[0];
+        avd5[1] = g_avd[1];
+        avd5[2] = g_avd[2];
+        avd5[3] = g_avd[3];
+        avd5[4] = g_avd[4];
+    }
     return 0;
 }
 
@@ -410,6 +433,6 @@ void se_selftest(void)
     if (se_class_val("process", &cls))
         return;
 
-    rc = se_compute_av(sctx, tctx, cls, &allowed, &flags);
+    rc = se_compute_av(sctx, tctx, cls, &allowed, &flags, (void *)0);
     pr_info("sehide: test av rc=%d allowed=%08x flags=%08x\n", rc, allowed, flags);
 }
