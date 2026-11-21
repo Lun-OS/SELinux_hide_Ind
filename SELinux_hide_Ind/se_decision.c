@@ -767,7 +767,16 @@ static int se_aden_replace(void *a0, void *a1, void *a2, void *a3,
     if (se_su_or_comp_hit(ssid, tsid) && !se_live_ok())
         g_recal_pending = 1;
 
-    goto orig;
+    /* inbound deny 失败路径：判定走 orig（出厂 -EACCES），但调用方
+     * avc_audit 用同一栈上 avd 计算 audited = denied & auditdeny
+     * （avc.h:134-136，avc.c:1193）——出厂 auditdeny 非零，审计记录
+     * 会带出 tcontext=su/comp 域（探针经 logcat 读回即 root 证据）。
+     * 清位 = dontaudit 语义：avd 为调用方栈副本（avc.c:1157 memcpy 自
+     * 缓存节点），清位不污染 avc 缓存、不写 live；allowed 位不动，
+     * 判定结果逐位保持出厂。仅 su/comp 相关请求清位，非相关透传
+     * （上方 goto orig）保持出厂纯净。RCU 读临界区内单条整数写，
+     * 无睡眠无分配，与 flip 同款纪律。 */
+    goto orig_audit_suppress;
 
 flip:
     if (avd) {
@@ -778,6 +787,12 @@ flip:
     }
     return 0;
 
+orig_audit_suppress:
+    if (avd) {
+        f = (se_u32 *)avd;
+        f[SE_AVD_OFF_AUDITDENY / 4] &= ~requested;
+    }
+    /* fallthrough */
 orig:
     /* 原样透传全部 9 个槽：8 参形状下第 9 个是无关值，原函数忽略。 */
     return ((se_aden_orig_t)(se_u64)se_aden_tramp)
