@@ -3,6 +3,8 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
+    paths:
+      - 'SELinux_hide_Ind/**'
 jobs:
   build:
     runs-on: ubuntu-latest
