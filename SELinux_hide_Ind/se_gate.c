@@ -2,16 +2,6 @@
 /* se_gate：问门（/access /context）+ 写门（/load） */
 #include "sehide.h"
 
-/*
- * 门路由原则：特权（uid<10000，root/system/shell，见
- * se_gate_privileged）走副本答案；非特权（uid>=10000）透传内核原版
- * —— 原版自己的权限门按出厂策略执行，行为与未接管逐字一致。
- * p_kuid 绑定失败时 fail-closed（全部透传），绝不能退化为"服务所有人"。
- * 红线（门最小化）：内核原生已拦截的地方不许多加门——本门只做 uid
- * 分流，非特权必须透传内核原版处理器（含原版权限门），不可由我们
- * 代码构造/改写返回内容。
- * 版本历史见 docs/selinux-hide/KPM-1.1.0-注释工作日志归档.md。
- */
 int se_gate_privileged(void)
 {
     if (!p_kuid)
@@ -21,8 +11,6 @@ int se_gate_privileged(void)
     return ((se_u32 (*)(void))p_kuid)() < 10000u;
 }
 
-/* 内核原函数指针：渲染失败时回落，绝不让调用方拿到错误。
- * 约束：必须在两个写处理器之前声明（使用先于声明会编译不过）。 */
 void *g_orig_access_write;
 void *g_orig_context_write;
 
@@ -470,17 +458,6 @@ passthrough:
     return -1;
 }
 
-/*
- * /load 门安装。红线：不能用 KP inline hook（p_kp_hook）改 sel_write_load
- * 函数体——hotpatch_nosync 清 stage-1 PTE RO 后裸写原物理页，MKP 设备
- * 上必死。两级：
- *   1) fops 数据槽：sel_load_ops 是 const file_operations，.write =
- *      sel_write_load（6.1 selinuxfs.c:674-677），与 write_op[] 两道问门
- *      同机制。头 64 字节值匹配（RANDSTRUCT 安全），fp_hook 后回读验证。
- *   2) 回读失败（该机 rodata 写也被保护）→ 影子页改 sel_write_load 入口
- *      （se_shadow.c，mkpms 同类，零物理页写入）。
- * g_orig_load_write 两种形态均与原函数签名等效，passthrough 无需改动。
- */
 int se_install_load_gate(void)
 {
     se_u32 fo;
@@ -530,32 +507,6 @@ int se_install_load_gate(void)
     return -3;
 }
 
-
-/* ==================== /policy 读门（fops 槽 + 内容自证） ====================
- *
- * 动机：apd 加载模块规则 = "读现行策略 → 加本模块规则 → 写回 /load"。
- * live 恒出厂 → 每个 blob = 出厂 + 单模块规则 → 整本吸收互相覆盖 →
- * LSPosed 规则被冲。修复 = 特权读 /policy 时把副本序列化给它，apd
- * 下次打包自动携带全部已收规则（链式累积）。
- *
- * 定位：hook 内核自己的活指针——sel_policy_ops（selinuxfs.c:505
- * verbatim）的 .open 槽 = sel_open_policy 真地址，内核链接期写死、
- * 每次 open 都在用——零符号解析风险。bak/槽定位全部经 KP 全表枚举
- * + 槽内容匹配自证，不依赖 L1 直读。
- *
- * hook（.open 槽替换，fp_hook 机制=access 门同款）：
- *   rc = bak(inode, filp)            —— 原版全链：avc 门/快照/i_size 原生
- *   rc!=0 → 返回（非特权被原版 avc 拒，零干预）
- *   特权（uid<10000）→ 内容自证定位 plm：filp 内指针槽 → 堆块前 8B ==
- *   L.bin_len（出厂策略长度，全系统唯一值）→ private_data 偏移标定缓存；
- *   inode 定位同理（内部含 ==L.bin_len 的槽 = i_size）→ 副本序列化替换：
- *   vfree(plm->data)（原出厂快照）→ plm->data/len = policydb_write(L.copy)
- *   输出（policy_file 游标语义 verbatim）→ i_size 同步（标定成功时）。
- *   任一步失败 → 保持原版快照（出厂语义，fail-closed）。
- *   release 原版 vfree(plm->data) 释放副本数据——内存闭环。
- * 自测：装完内核态 filp_open 一次 /policy；区分"open 环境失败"（不降级，
- * 等真实流量）与"open 成功但 served=0"（=槽指错 → 恢复槽降级）。
- * ========================================================================== */
 
 static unsigned long g_rp_ops_base;      /* sel_policy_ops 基址（枚举） */
 static int g_rp_open_off;                /* .open 槽偏移（槽匹配标定） */
@@ -838,8 +789,7 @@ static void se_uninstall_read_gate(void)
 /* 卸载还原。把 write_op[] 中仍指向我们 wrapper 的槽写回原函数。
  * 幂等：找不到（未装/已还原）静默跳过。模块退出后槽位绝不能悬空指向
  * 已释放的模块内存。
- * 流程红线：链接期未解析符号编译静默——每次产物必须 nm -u 对比基线
- * （历史上发生过卸载函数被误删导致 KP 加载器拒载的整模块事故）。 */
+ * 流程红线：链接期未解析符号编译静默——每次产物必须 nm -u 对比基线 */
 static void se_restore_slot(unsigned long base, void *ours, void *orig, const char *tag)
 {
     se_u32 i;

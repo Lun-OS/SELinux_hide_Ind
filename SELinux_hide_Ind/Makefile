@@ -18,13 +18,13 @@ INCLUDE_FLAGS += -I$(KP_DIR)/kernel/linux
 
 objs := sehide_main.o se_util.o se_symbol.o se_layout.o se_policydb.o se_rules.o se_render.o se_gate.o se_bprm.o se_recal.o se_shadow.o se_status.o se_decision.o
 
-all: SELinux_hide_From_LunSU.kpm
+all: SELinux_hide_Ind.kpm
 
-SELinux_hide_From_LunSU.kpm: ${objs}
+SELinux_hide_Ind.kpm: ${objs}
 	${CC} -r -o $@ $^
 
 %.o: %.c
-	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -TSELinux_hide_From_LunSU.lds -c -O2 -o $@ $<
+	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -TSELinux_hide_Ind.lds -c -O2 -o $@ $<
 
 .PHONY: clean
 clean:

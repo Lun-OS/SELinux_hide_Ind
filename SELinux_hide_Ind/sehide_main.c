@@ -2,13 +2,12 @@
 /* sehide_main：模块入口/装配/控制面 */
 #include "sehide.h"
 
-KPM_NAME("SELinux_hide_From_LunSU");
-KPM_VERSION("1.1.0");
+KPM_NAME("SELinux_hide_Ind");
+KPM_VERSION("1.1.1");
 KPM_LICENSE("AGPL v3");
 KPM_AUTHOR("Lun.");
-KPM_DESCRIPTION("LunSU SELinux hide engine for KernelPatch");
+KPM_DESCRIPTION("github@Lun-OS ; Built-in the boot to achieve cleaner SELinux_hide");
 
-/* 版本历史与演进记录：见 docs/selinux-hide/KPM-1.1.0-注释工作日志归档.md */
 static const char *se_ver = "1.1.0";
 
 long sehide_init(const char *args, const char *event, void *__user reserved)
@@ -19,17 +18,12 @@ long sehide_init(const char *args, const char *event, void *__user reserved)
     (void)event;
     (void)reserved;
 
-    /* 横幅自证版本：装机日志核对刷入版本与分派形状；只打印表查询结果，
-     * 不做探测、不据此开关任何功能。 */
-    pr_info("sehide: kernel %x, kernelpatch %x, v%s shape=%s state=%d\n",
-            kver, kpver, se_ver,
-            se_kver_aden() == SE_ADEN_9S ? "9s" :
-                (se_kver_aden() == SE_ADEN_8 ? "8" : "9b"),
-            se_kver_has_state());
+    /* 三级符号解析链绑定（syms[] 唯一填充点，必须在任何符号消费前执行；
+     * 漏调 = 全部符号 MISSING = 引擎 off = 生态注入裸奔落 live） */
     se_bind_symbols();
 
-    /* 影子页坐标系重建（TCR/TTBR1 + kallsyms 符号，双自证）。
-     * 失败只关影子页子系统，fops 数据槽路径不受影响。 */
+    /* 影子页坐标系重建
+       失败关影子页子系统 */
     se_shadow_init();
 
     for (i = 0; i < NSYM; i++)
@@ -41,15 +35,6 @@ long sehide_init(const char *args, const char *event, void *__user reserved)
         return 0;
     }
 
-    /*
-     * 只绑符号，不碰策略。
-     *
-     * KPM 默认在 pre-kernel-init 装载，那时 SELinux 策略还没读进来，
-     * security_read_policy() 的第一句就是 `if (!state->initialized)
-     * return -EINVAL;`，标定必然 -22。策略是在 Android init 的
-     * selinux_initialize() 里加载的，早于 early-init，所以真正的安装挂到
-     * .kpm.event 的 init 阶段事件上（见 sehide_event）。
-     */
     pr_info("sehide: symbols bound, waiting for init event\n");
     return 0;
 }
@@ -57,7 +42,7 @@ long sehide_init(const char *args, const char *event, void *__user reserved)
 /*
  * 安装引擎：标定 -> 决策面/副本 -> 门与钩子。
  *
- * 红线：不能在 KPM_EVENT（RCU 读临界区）里做任何睡眠类操作或 grace
+ * 不能在 KPM_EVENT（RCU 读临界区）里做任何睡眠类操作或 grace
  * 等待——本函数只允许在 se_bprm_wrap（真进程上下文，可睡眠，调用方
  * 已持 g_recal_busy CAS 锁）里执行。
  */
@@ -79,12 +64,6 @@ int se_install_engine(void)
     }
     pr_info("sehide: su type=%u\n", L.su_type);
 
-    /*
-     * 组件域 = 生态域：KP 生态在 execve 路径把组件会话安排进
-     * u:r:magisk:s0，且其策略加载钩子保证 live 里必有 magisk 类型；
-     * 硬编码 su 会覆盖生态域、断掉 KP package_config 通道（zygisk
-     * 全灭）。标定：live 有 magisk → comp=magisk；否则（旧生态）→ su。
-     */
     if (se_ctx_type("u:r:magisk:s0", &g_comp_type) == 0 && g_comp_type) {
         g_comp_ctx = "u:r:magisk:s0";
         g_comp_tname = "magisk";
@@ -95,19 +74,6 @@ int se_install_engine(void)
     }
     pr_info("sehide: comp domain=%s type=%u\n", g_comp_ctx, g_comp_type);
 
-    /*
-     * 装配顺序契约（对齐 LunSU "Gates first, bits second"）：
-     * 标定 → sid 标定 → 决策面挂载 → 副本 → 门。
-     *
-     * live 保持干净：live 是内核当前管理的实时策略，"干净" = 非特权
-     * 全部视角与未 root 无差异；特权善后只在我们的代码（副本 + 决策面
-     * 翻转），live 恒出厂。
-     *
-     * 决策面挂载（自建，不调用 KP hook()）：p_adenied 地址链
-     * （patch_config → 内核 kallsyms 直查）→ 前缀备份+PC 相关校验 →
-     * aarch64_insn_patch_text 写 KP replace 入口 → 活体自检
-     * （avc_has_perm(非su源→su, binder) rc==0 唯一归因）。
-     */
     rc = se_derive_layout();
     if (rc) {
         pr_info("sehide: derive rc=%d (symtab/avtab)\n", rc);
@@ -140,7 +106,7 @@ int se_install_engine(void)
         }
 
         /* 决策面挂载 + 活体自检。失败 = 降级（DEGRADED）：门照装——
-         * 红线：拦生态注入是 live 干净的硬需求，门必须先于/独立于决策面
+         * 拦生态注入是 live 干净的硬需求，门必须先于/独立于决策面
          * 在岗，否则生态注入裸奔落 live，非特权 oracle 全可见；
          * 翻转缺失（su 功能缺）显性化；副本不打 inbound stamp（oracle 与
          * 实际一致保持在出厂语义侧）。 */
@@ -154,13 +120,13 @@ int se_install_engine(void)
         se_build_copy();      /* 副本按 se_decision_ready() 决定 inbound stamp */
         se_selftest();
 
-        /* ---- 门（无论决策面成败都装，见上方红线） ---- */
+        /* ---- 门 ---- */
         if (se_install_gate())
             pr_info("sehide: gate access not installed\n");
         if (se_install_gate_ctx())
             pr_info("sehide: gate ctx not installed\n");
         /*
-         * /load 门：LunSU 生态模块规则的唯一通道是 handle_sepolicy
+         * /load 门：KernelSU 生态模块规则的唯一通道是 handle_sepolicy
          * supercall（进副本，"live is never written"）；APatch 生态的
          * 注入通道是写 /sys/fs/selinux/load（apd/libsepol），不拦则
          * magisk/lsp 类型与规则真落 live —— 非特权 oracle 全可见。
@@ -199,7 +165,7 @@ int se_install_engine(void)
     }
 
     /*
-     * 红线：这里不能调 avc_ss_reset()——4.19 的 avc_ss_reset →
+     * 这里不能调 avc_ss_reset()——4.19 的 avc_ss_reset →
      * avc_callbacks 会走到 selinux_netcache_avc_callback() →
      * synchronize_net() → synchronize_rcu()，在 RCU 读段里等 grace
      * = 自己等自己（Illegal synchronize_rcu() panic，init 卡死）。
@@ -305,7 +271,7 @@ long sehide_control0(const char *args, char *__user out_msg, int outlen)
 }
 
 /*
- * 新增：kpatch ctl 子命令 —— sepolicy 批处理入口
+ * kpatch ctl 子命令 —— sepolicy 批处理入口
  *
  * KP 的控制面（KPM_CTL0）只有字符串 args，没有 KSU supercall 的 __user
  * 指针，所以批量 payload 走文件：内核侧 filp_open + kernel_read 读入后
@@ -371,7 +337,7 @@ long sehide_exit(void *__user reserved)
     se_uninstall_hook();
 
     /*
-     * 释放两代副本（对齐 LKM 模块移除路径）。门卸载后不再有人无锁读
+     * 释放两代副本。门卸载后不再有人无锁读
      * L.copy，此刻立即析构是安全的；延迟一代只是运行期换代的纪律。
      */
     if (L.copy && p_pdb_destroy)
@@ -390,7 +356,7 @@ long sehide_exit(void *__user reserved)
  * .kpm.event（module.c:685-698，全程持 rcu_read_lock）。post-fs-data 走
  * 的是 apd，不经过这条路，所以这里只用上面四个名字。
  *
- * 红线：event 回调运行在 RCU 读临界区内，睡眠类操作（policydb_read/
+ * event 回调运行在 RCU 读临界区内，睡眠类操作（policydb_read/
  * se_alloc）与 grace 等待全部禁止。这里只做原子安全的 bprm 钩子安装
  * （fp_hook 数据槽 / 影子页，均无 grace 等待）；引擎主体延到首个 exec
  * 的 se_bprm_wrap（真进程上下文，可睡眠，CAS 互斥）——时机必然晚于

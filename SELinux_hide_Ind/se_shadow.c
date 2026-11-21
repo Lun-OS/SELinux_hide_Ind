@@ -1,47 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * se_shadow.c - mkpms 式页分裂影子页 hook。
- *
- * 原理（全部源码实证，禁止猜测）：
- *   KP 的 hook()/fp_hook() 都走 hotpatch_nosync（hotpatch.c:80-95）——清 stage-1
- *   PTE 的 RO 位后裸写原 VA，即写原物理页。stage-2（MTK MKP/EL2）锁的是物理页，
- *   装机实证 text 写必死。影子页方案：分配新物理页承载修改，改 stage-1 页表
- *   （页表页不在 MKP 的 krn code/krn rodata 保护清单）让 VA 执行流走
- *   影子页，原物理页一字节不动。
- *
- * 坐标系重建：
- *   KP 内部全局 page_shift/linear_voffset/pgd_va 不在 KP 符号表（仅
- *   KP_EXPORT_SYMBOL 进表，symbol.h:23 + kpimg.lds:89），KPM 引用即 unknown
- *   symbol 拒载。本文件按 KP 自身的运行期探测法（map.c:123-168）重建：
- *     - page_shift：TCR_EL1.TG1（bits31:30；1→16K、3→64K、0→4K，map.c:130-137）
- *     - va_bits：64 - TCR_EL1.T1SZ（bits21:16，map.c:126 同式）
- *     - PAGE_OFFSET = -(1<<va_bits)（6.1 memory.h:44）
- *     - PHYS_OFFSET = memstart_addr（memory.h:204，kallsyms D 段可见）
- *     - linear_voff = PAGE_OFFSET - PHYS_OFFSET（memory.h:308 __phys_to_virt）
- *     - kimage_voff：kallsyms 可见变量读出（memory.h:210）
- *     - pgd = TTBR1_EL1.BADDR + linear_voff（map.c:165-168 同式）
- *   自证两条，任一失败整个影子页子系统拒绝启用：
- *     ① ttbr1 BADDR == swapper_pg_dir - kimage_voffset（TTBR1 即内核主 pgd）
- *     ② walk(_text) 得到的 PA == _text - kimage_voffset（walk 与 phys 换算自洽）
- *
- * 分裂：
- *   6.1 内核自己的重映射通道不可用——alloc_init_cont_pte() 第一句
- *   BUG_ON(pmd_sect(pmd))（mmu.c:204），对已存在的 2MB block 做页级重映射直接
- *   BUG 崩溃。故分裂手写：PTE 表 512 项由块描述符派生（PMD_TYPE_TABLE=3<<0 /
- *   PMD_TYPE_SECT=1<<0 / PTE_TYPE_PAGE=3<<0，pgtable-hwdef.h:115/116/145），
- *   CONT 位必须清（pgattr_change_is_safe：mmu.c:150-152 "live contiguous
- *   mappings may not be manipulated at all"），块描述符带 CONT 时 v1 直接拒绝。
- *
- * 换页：
- *   stop_machine（stop_machine.c:624-633，cpus=NULL 即全 online 核停）内做
- *   break-before-make（invalid → dsb+tlbi → new → dsb+tlbi）——停住的核不会
- *   经过该页，无取指撕裂窗口。TLB 维护指令按 pgtable.h 的 tlbi 宏原样自写
- *   （flush_tlb_kernel_range 引用 page_shift 全局，不能直接调）。
- *
- * backup：
- *   影子页含原函数完整拷贝，跳板 16B（BTI/PAC 变体 20B）之后的地址就是原函数
- *   续体——backup = shadow + off + tramp_len，零指令重定位（对比 KP hook 的
- *   relo 机制少一整类边界 bug，hook.c:471-545）。
  */
 #include "sehide.h"
 #include <pgtable.h>
@@ -62,7 +21,7 @@ int g_shadow_installed;
 int g_mm_ok;
 int g_mm_page_shift;
 
-/* 页表坐标系（map.c:123-168 同式重建） */
+/* 页表坐标系 */
 struct se_mm {
     int ok;
     int page_shift;
@@ -75,7 +34,6 @@ static struct se_mm MM;
 
 static void se_tlb_va(se_u64 va)
 {
-    /* pgtable.h:231-236 tlbi_vaddr + flush_tlb_kernel_page 同式，asid=0 */
     se_u64 x = (va >> 12) & mask_ul(43, 0);
 
     dsb(ishst);
@@ -130,7 +88,7 @@ static int se_walk(se_u64 va, se_u64 *entry_out, se_u64 *desc_out, int *lv_out)
     return 0;
 }
 
-/* 物理地址（pgtable_phys，start.c:352-375 同式） */
+/* 物理地址 */
 static se_u64 se_pa(se_u64 va)
 {
     int ps = MM.page_shift, pxd_bits = ps - 3;
@@ -174,7 +132,6 @@ int se_shadow_init(void)
     if (!p_memstart || !p_kimage_voff || !p_swapper || !p_text)
         return -1;
 
-    /* TCR_EL1：T1SZ bits[21:16]、TG1 bits[31:30]（map.c:123-137 同式） */
     __asm__ __volatile__("mrs %0, tcr_el1" : "=r"(tcr));
     t1sz = (int)((tcr >> 16) & 0x3full);
     tg1 = (int)((tcr >> 30) & 3ull);
@@ -183,23 +140,11 @@ int se_shadow_init(void)
         int va_bits = 64 - t1sz;
         int pxd_bits = MM.page_shift - 3;
 
-        MM.page_level = (va_bits - 4) / pxd_bits;       /* map.c:156 同式 */
+        MM.page_level = (va_bits - 4) / pxd_bits;      
     }
 
     /*
      * linear 映射偏移改用 KP 的运行期实测值。
-     *
-     * 根因终审（br_0249 闭环）：memstart 双源同值（0x40000000，合理）
-     * 但 walk 仍 0 → 公式假设（PAGE_OFFSET=-(1<<va_bits)、PHYS_OFFSET=
-     * memstart_addr、或运算等价性）与该设备内核实际线性映射配置不符。
-     * KP 的 linear_voffset（map.c:141-148 verbatim）在 boot 早期用内核
-     * memblock 分配器传精确 phys 拿 virt 实测——绕开一切公式假设，KP
-     * hook 在本机工作正常即其正确性的活体证明。KP 的实测函数是 __init
-     * （boot 后已释放），KPM install 时机无法重演 → 直接读 KP 实测好的
-     * linear_voffset 全局（symbol_lookup_name 走 KP 符号表，精确）。
-     * 这是 boot 期才可获得的信息、KP 宿主必在——"必须经过"边界内的
-     * 数据依赖，非机制依赖。旧公式保留为兜底（KP 符号缺失时）。
-     * 强自证 = walk(_text) PA == va-kimgvoff（三方自洽）不变。
      */
     {
         unsigned long kp_lvoff = symbol_lookup_name("linear_voffset");
@@ -214,38 +159,20 @@ int se_shadow_init(void)
     if (se_kread(&kimgvoff, (void *)(se_ulong)p_kimage_voff, 8))
         return -3;
 
-    /*
-     * memstart_addr 是 D 段数据符号，L1 对其错地址（secclass_map
-     * 同族实证）→ linear_voff 错 → walk
-     * 全链 0（历次装机 selfcheck2 fail phys=0，selfcheck1
-     * 不依赖 linear 故仍过——日志特征吻合）。修复：走完换算+自证②，
-     * 失败时用 KP 全表枚举重解析 memstart_addr 再试一轮；强自证 =
-     * walk(_text) 的 PA 与 kimg 换算一致（三方自洽），错值必然失败。
-     * 两轮都失败 → MM.ok=0（影子页整支关闭，fail-closed）。
-     */
     {
         int retry;
 
         for (retry = 0; retry < 2; retry++) {
             se_u64 phys;
 
-            /* PAGE_OFFSET = -(1<<va_bits)（memory.h:44）；PHYS_OFFSET =
-             * memstart_addr（memory.h:204）；__phys_to_virt(x) =
-             * (x - PHYS_OFFSET) | PAGE_OFFSET（memory.h:308）=>
-             * linear_voff = PAGE_OFFSET - PHYS_OFFSET */
-            /* KP 实测值优先（boot 期 memblock 实测，见上）；公式为兜底 */
             MM.linear_voff = linear_voff_override ?
                 linear_voff_override :
                 (se_u64)(0ull - (1ull << (64 - t1sz))) - memstart;
             MM.kimage_voff = kimgvoff;
 
-            /* pgd：TTBR1_EL1 BADDR（map.c:165-168 同式） */
             __asm__ __volatile__("mrs %0, ttbr1_el1" : "=r"(ttbr1));
             MM.pgd_va = (ttbr1 & 0xFFFFFFFFFFFEull) + MM.linear_voff;
 
-            /* 自证①：TTBR1 即内核主 pgd（swapper_pg_dir - kimage_voffset）。
-             * KPTI 内核运行期 TTBR1 也是 swapper_pg_dir（tramp_pg_dir 仅
-             * 入口切换用）。不依赖 linear_voff，两轮等价。 */
             if ((ttbr1 & 0xFFFFFFFFFFFEull) !=
                 ((se_u64)p_swapper - kimgvoff)) {
                 pr_info("sehide: shadow selfcheck1 fail ttbr1=%016lx "
@@ -256,10 +183,9 @@ int se_shadow_init(void)
                 return -4;
             }
 
-            /* 自证②：walk(_text) 的 PA 与 kimg 换算一致（三方自洽） */
             phys = se_pa((se_u64)p_text);
             if (phys && phys == (se_u64)p_text - kimgvoff)
-                break;                   /* 本轮换算可信 */
+                break;         
 
             pr_info("sehide: shadow selfcheck2 retry=%d text=%016lx "
                     "phys=%016llx memstart=%016llx src=%s\n",
@@ -323,7 +249,7 @@ static int se_shadow_stop_cb(void *arg)
     return 0;
 }
 
-/* 清影子页自身 PTE 的 PXN/GP（start.c:444 KP hook 区 RWX 化同款；
+/* 清影子页自身 PTE 的 PXN/GP；
  * 写的是 vmalloc 区自己的页表页，不碰保护面）。CONT 组按
  * hotpatch.c:60-78 modify_entry_kernel 的纪律整组处理。 */
 static int se_shadow_make_exec(void *shadow)
@@ -333,7 +259,7 @@ static int se_shadow_make_exec(void *shadow)
 
     if (se_walk((se_u64)(se_ulong)shadow, &entry_va, &desc, &lv) < 0)
         return -1;
-    /* CONT 组纪律（mmu.c:150-152）：vmalloc 页带 CONT 极罕见
+    /* CONT 组纪律：vmalloc 页带 CONT 极罕见
      * （仅 VM_ALLOW_HUGE_VMAP），拒绝而非整组改写 —— 与目标页的
      * 拒绝策略一致，不引入 CONFIG_ARM64_CONT_PTE_SHIFT 依赖。 */
     if (desc & (1ull << 52))
@@ -364,7 +290,7 @@ int se_shadow_hook(void *target, void *replace, void **backup)
     if (rc < 0)
         return -11;
 
-    /* CONT 组纪律：live contiguous mappings may not be manipulated（mmu.c:150）。
+    /* CONT 组纪律：live contiguous mappings may not be manipulated
      * v1 拒绝这类页，功能关闭打日志，绝不打折扣。 */
     if (desc & (1ull << 52))
         return -21;
@@ -378,7 +304,7 @@ int se_shadow_hook(void *target, void *replace, void **backup)
     page_va = tva & ~(page_size - 1ull);
     off = tva - page_va;
 
-    /* 影子页：vmalloc（hotpatch.c:186 alias_page 同款通道） */
+    /* 影子页：vmalloc */
     shadow = ((void *(*)(se_ulong))p_vmalloc)(page_size);
     if (!shadow)
         return -12;
@@ -387,8 +313,7 @@ int se_shadow_hook(void *target, void *replace, void **backup)
         return -13;
     }
 
-    /* 跳板：branch_absolute 编码（hook.c:307-315），BTI/PAC 首指令处理
-     * （hook.c:536-541 hook_prepare 同款） */
+    /* 跳板：branch_absolute 编码，BTI/PAC 首指令处理 */
     se_kread(&first, target, 4);
     if (first == ARM64_PACIASP || first == ARM64_PACIBSP)
         tramp[tramp_n++] = ARM64_BTI_JC;

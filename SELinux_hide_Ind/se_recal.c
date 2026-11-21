@@ -121,8 +121,6 @@ int se_recalibrate_light(void)
      * 路径与决策面置旗探测（见 se_comp_upgrade）。 */
     se_comp_upgrade();
 
-    /* sid 重算前移（决策面判定用新 sid，重载后立即可用）
-     * → 决策面就绪则跳过三件套重写（live 归零）；未就绪回退现状形态。 */
     if (p_secctx_to_sid)
         ((int (*)(const char *, se_u32, se_u32 *))p_secctx_to_sid)
             ("u:r:su:s0", sizeof("u:r:su:s0") - 1u, &sid);
@@ -141,9 +139,6 @@ int se_recalibrate_light(void)
         g_comp_sid = csid ? csid : sid;
     }
 
-    /* live 归零语义：决策面在岗则只刷新白名单（live 保持出厂）；
-     * 决策面未在岗时 live 同样保持出厂（root 功能缺失由装机自检
-     * 日志显性化），绝不回写三件套污染非特权面。 */
     if (se_decision_ready()) {
         se_decision_recalibrate();  /* 白名单随重载刷新 */
         pr_info("sehide: recal light — decision-plane flip active, live clean\n");
@@ -195,7 +190,6 @@ int se_recalibrate_full(void)
     if (!g_comp_type || (strcmp(g_comp_ctx, "u:r:su:s0") == 0))
         g_comp_type = L.su_type;
 
-    /* sid 重算前移 → 决策面就绪则跳过三件套重写。 */
     if (p_secctx_to_sid)
         ((int (*)(const char *, se_u32, se_u32 *))p_secctx_to_sid)
             ("u:r:su:s0", sizeof("u:r:su:s0") - 1u, &sid);
@@ -246,7 +240,7 @@ int se_recalibrate_full(void)
  *   不依赖 selinux_state 布局；seqno 传 0（内核 setenforce 路径先例，
  *   4.19 selinuxfs.c:179），只清缓存不推 notif。
  *
- * 红线：avc_ss_reset 内部 avc_flush 用 call_rcu 异步释放，不
+ * avc_ss_reset 内部 avc_flush 用 call_rcu 异步释放，不
  * synchronize_rcu——但绝不能从 KP event 线程（RCU 读临界区）调。
  * 本函数的调用点只有重标定路径，入口是两道门与 bprm 钩子，全部是
  * 进程上下文，可睡眠，安全。

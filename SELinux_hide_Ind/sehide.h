@@ -1,10 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * sehide.h - SELinux_hide_From_LunSU KPM 共享内部头。
  *
  * 分层：se_util / se_symbol / se_layout / se_policydb / se_rules /
  *   se_render / se_gate / se_bprm / se_recal / sehide_main
- * 版本历史见 docs/selinux-hide/KPM-1.1.0-注释工作日志归档.md。
  */
 #ifndef __SEHIDE_H
 #define __SEHIDE_H
@@ -367,8 +365,6 @@ int se_perm_mask(const char *cls, const struct se_rule *r, se_u32 *out);
 int se_perm_mask_name(void *pdb, const char *cls, const char *perm, se_u32 *out);
 int se_add_allow_at(void *pdb, se_u32 src, se_u32 tgt, se_u32 cls, se_u32 bits);
 int se_clear_allow_at(void *pdb, se_u32 src, se_u32 tgt, se_u32 cls, se_u32 bits);
-/* se_apply_inbound_g / se_apply_trio 已随三件套删除：live 恒出厂，
- * 三件套的放行职责由决策面唯一承担，见 se_decision.c 头注释。 */
 
 /* ---------------- se_decision.c（决策面翻转） ----------------
  * live 归零后的 su/组件域放行通道：唯一 hook = avc_denied 收口的
@@ -391,13 +387,12 @@ void se_retire_copy(void *fresh);
 se_u32 se_copy_attrs(void *pdb, se_u32 *out, se_u32 cap);
 int se_build_copy(void);
 int se_stamp_rules(void *pdb);   /* 新增：在给定副本上重打引擎规则（build_copy / load 门共用） */
-int se_role_bits(int value);     /* 新增：live 的 role 条件位（LunSU 第三类 live 写） */
+int se_role_bits(int value);     /* 新增：live 的 role 条件位 */
 int se_absorb_blob(const se_u8 *blob, se_u32 blen);
 int se_load_worker_start(void);  /* blob 新增类型声明注入 live */
 /* se_allow_transition（早期死代码，全工程无调用点）已删 —— transition 放行
  * 由 se_decision.c 的决策面翻转覆盖（hooks.c binder 检查的 avc_has_perm
  * denied 落入 avc_denied 收口，tsid==su 翻转放行）。 */
-/* se_rules[] / se_role_bits 已随三件套删除。 */
 
 /* ---------------- se_render.c ---------------- */
 int se_ctx_to_sid(const char *s, se_u32 *sid_out);
@@ -446,17 +441,7 @@ extern se_u32 g_su_sid;
 extern int g_hook_done;
 extern int g_install_fails;
 
-/*
- * 组件域参数化（三件套/切域/副本盖章作用于"生态组件域"，而不是
- * 硬编码 su）。KP 生态组件域 = magisk（KP handle_before_execve 实证），
- * 硬编码 su 会覆盖 KP 的域设置、断掉 KP package_config 通道（zygisk
- * 全灭）。
- *
- * 标定（se_install_engine，一次性）：
- *   live 有 "u:r:magisk:s0" 类型 → comp = magisk（KP 生态）
- *   否则                         → comp = su（4.19 等旧生态，装机验证路径）
- * 重载自愈（se_recalibrate_light/full）随 su_type 一起重解析 comp_type/sid。
- */
+
 extern se_u32 g_comp_type;      /* 组件域 type 值（live policydb symtab） */
 extern se_u32 g_comp_sid;       /* 组件域 sid（secctx_to_sid 标定，切域写入值） */
 extern const char *g_comp_ctx;  /* "u:r:magisk:s0" | "u:r:su:s0" */
@@ -488,7 +473,7 @@ extern volatile int g_comp_pending;    /* 1 = 组件域探测待办，待 se_com
 extern se_u32 g_recal_total;
 extern int g_eco_loaded;   /* 生态重载已发生 */
 
-/* ---------------- se_rules.c（新增，LunSU rules.c 1:1） ---------------- */
+/* ---------------- se_rules.c ---------------- */
 long se_handle_sepolicy(const se_u8 *payload, se_u32 len);
 
 /* ---------------- sehide_main.c ---------------- */

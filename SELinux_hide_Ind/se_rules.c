@@ -1,21 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/*
- * se_rules.c - 改①：LunSU kernel/selinux/rules.c handle_sepolicy 的 KPM 后端。
- *
- * wire format 1:1（sepol_data 8 字节头 + {u32 len; 字符串[len+1]}，len==0 为
- * ALL），与 KSU ksud 的批量产物逐字节同构。批量写目标恒为副本：进入即
- * CAS g_recal_busy（与重标定/写门互斥），live 永不被写，无 flush
- * （副本只被渲染器读，改完即生效）；批量部分成功保留（对齐 LKM）。
- *
- * 与 LKM 的差异（唯一一处，属"略微调整"）：
- *   底层是 KPM 的 avtab 直写原语，不是 LKM 的 ksu_*（后者有内核内部分配器，
- *   能做 symtab/hashtab 级插入）。因此：
- *     支持  NORMAL_PERM allow/deny、TYPE_STATE permissive/enforce
- *     拒绝  XPERM/TYPE/TYPE_ATTR/ATTR/TYPE_TRANSITION/TYPE_CHANGE/GENFSCON
- *           （返回 -EOPNOTSUPP，各打一条日志）
- *   引擎自身的域建立不依赖这些命令（su 域出厂已存在），
- *   子集覆盖模块规则的真实使用面；LKM 侧命令集保持全量不变。
- */
+
 #include "sehide.h"
 
 struct sepol_data {
@@ -253,7 +237,7 @@ static int apply_one_sepolicy_cmd(void *db, const struct sepol_data *header, con
             return -22;
         }
 
-    /* 以下命令需要 symtab/hashtab 级插入或 xperm datum，KPM v1 后端不支持 */
+    /* 以下命令需要 symtab/hashtab 级插入或 xperm datum */
     case KSU_SEPOLICY_CMD_XPERM:
     case KSU_SEPOLICY_CMD_TYPE:
     case KSU_SEPOLICY_CMD_TYPE_ATTR:
@@ -272,13 +256,6 @@ static int apply_one_sepolicy_cmd(void *db, const struct sepol_data *header, con
     }
 }
 
-/*
- * 与 LKM handle_sepolicy 同构的批处理入口。差异仅两处：
- *   入参是内核缓冲（control0 经文件读入），不再是 __user 指针；
- *   互斥用 g_recal_busy CAS（KPM 无 policy_mutex 等价物）。
- * 语义保留：部分成功保留（"A partially applied batch stays applied"）、
- * 无 flush、全程不碰 live。
- */
 long se_handle_sepolicy(const se_u8 *payload, se_u32 len)
 {
     struct sepol_batch_cursor cursor;

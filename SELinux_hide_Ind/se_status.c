@@ -1,24 +1,11 @@
 /*
- * status 页冻结（LunSU fake_status 的 KPM 移植，最小实现）。
+ * status 页冻结。
  *
- * 背景：/sys/fs/selinux/status 是世界可读的内核状态页，其中 policyload
- * 字段每次策略载入 +1（出厂 boot 只载 1 次）。KP 核心重载与模块策略
- * 注入都会推高它 —— 非特权观测面由此偏离出厂状态（本机实测
- * policyload=6，出厂应为 1）。LunSU 的解法是 fake_status 冻结页
- * （LKM selinux_hide.c initialize_fake_status / my_sel_open_handle_status）。
- *
- * 本实现只替换 sel_handle_status_ops 的 .read 槽（rodata 数据槽写，与
- * write_op[] 门同一 SE_FPHOOK 通道 + 回读验证）：uid>=10000（非特权）
- * 读到冻结的出厂快照，uid<10000（特权：root/system/shell）走原版读
- * 真实值。open/mmap 槽不动 —— 原版 open 正确设置 private_data，
- * read/mmap 路径对特权完整保留；非特权 mmap 该节点的场景在检测面中
- * 未见使用（read 是 cat/Java IO 的唯一常规路径），残余风险已明示。
- *
- * 冻结值全部真值化，零硬编码偏移：
+ * 冻结值全部真值化：
  *   struct selinux_kernel_status（security.h:366-375，__packed 20 字节，
  *   4.19~6.6 双树逐字一致）：
  *   version      = 1（结构版本常量，两树恒 1）
- *   sequence     = 0（出厂 boot 结束语义；LunSU late_load 同款 <6.10 填 0）
+ *   sequence     = 0（出厂 boot 结束语义）
  *   enforcing    = 安装期读 /sys/fs/selinux/enforce（真值）
  *   policyload   = 1（出厂语义：boot 载入一次）
  *   deny_unknown = 安装期读 /sys/fs/selinux/deny_unknown（S_IRUGO，真值）

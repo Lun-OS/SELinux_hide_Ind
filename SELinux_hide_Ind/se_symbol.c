@@ -530,8 +530,6 @@ void se_bind_symbols(void)
      * 权限名→1<<(perdatum->value-1)；第一参数=struct policydb *，传副本。 */
     p_str2cls        = se_sym("string_to_security_class");
     p_str2av         = se_sym("string_to_av_perm");
-    /* /policy 读门——副本序列化三件套（全部 T 段，装机 kallsyms
-     * br_0121 verbatim 可见：policydb_write/vmalloc_user/vfree）。 */
     p_pdb_write      = se_sym("policydb_write");
     p_vmalloc_user   = se_sym("vmalloc_user");
     p_vfree          = se_sym("vfree");

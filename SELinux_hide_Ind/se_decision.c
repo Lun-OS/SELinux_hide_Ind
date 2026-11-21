@@ -1,52 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* se_decision：决策面翻转 —— su/组件域的放行通道（live 恒出厂）。
- *
- * 唯一 hook 点：avc_denied（denied 唯一收口，6.1 avc.c:1021 / 4.19
- * avc.c:1017，两版 9 参 verbatim 同构，noinline 不随 LTO 漂移；
- * 缓存命中/miss/xperm 三路全必经）。可替代层不可用：hooks.c:3121
- * （inode_permission）与 hooks.c:1608（cred_capable）直调 noaudit
- * 绕过外层入口，上移会漏 su 文件主路径；hook noaudit 符号则 LTO
- * 内联盲区回归。
- *
- * 挂载三态：
- *   direct  —— KP 未挂时直接接管 avc_denied 内核入口；
- *   coexist —— KP 补丁在岗时，备份 KP pad、补丁写 avc_denied（内核
- *              text），trampoline 纯重定向到 KP replace（KP task_ext
- *              按任务授予完整保留）。
- * 运行链：调用方 → 我们补丁 → 判定；不匹配 → backup trampoline →
- * 原始函数本体（非特权透传内核原生处理）。
- *
- * 补丁原语：
- *   1) 地址解析：主源 p_adenied = se_sym("avc_denied")（kallsyms 裸名；
- *      解析地址上恰为 KP 标准补丁格式即活体交叉验证）；互证源
- *      patch_config->avc_denied（可达即比对，不一致拒挂）；L3
- *      by_suffix 备用。
- *   2) 前缀备份 + PC 相关校验（B/BL/B.cond/ADR/ADRP/LDR 字面量/CB/TB
- *      命中即 off——复制后会再执行）。
- *   3) 写入：内核原生 aarch64_insn_patch_text（自带 stop_machine +
- *      RO 处理 + icache），改写为 [BTI JC] + LDR X17/BR X17/addr64。
- *      红线：补丁落点只允许内核 text 与本模块 .text；KP 分配 VA
- *      （kpimg/KPM 映射区）经 patch_map 的地址翻译不可靠（写入落错
- *      物理页 → 随机内核 text 损坏），一律禁止作为目标。
- *   4) trampoline：本模块 .text，内容由内核 patch_text 写入。
- *   5) 活体自检：avc_has_perm(init→su, binder, 全权)——出厂必 deny，
- *      rc==0 当且仅当 hook 在岗，唯一归因；失败恢复前缀、引擎 off。
- *   6) 卸载对称：patch_text 恢复备份前缀。
- *
- * replace 语义：
- *   - 相关性分诊（第一分支）：非 su/comp sid 相关请求 → 透传内核
- *     （见 se_aden_replace 内注释）；
- *   - outbound（源==su/comp）全类 flip：改 avd（allowed=全 1/
- *     auditallow=0/auditdeny=0）+ return 0 —— 不写缓存（缓存保留
- *     出厂真值，每次 denied 现场放行）、不打 audit 日志；
- *   - inbound（目标==su/comp）→ KSU 规则集 (类,perm,源域) 精确匹配
- *     （se_ksu_rule_mask）：全类组全置；位组 allowed |= requested&mask、
- *     auditdeny 同步清位，未点名位维持出厂 deny；
- *   - 副本收口：规则集外的 su/comp 相关请求查副本生态规则；
- *   - 其余 → backup 链（KP 语义 → 原函数）。
- *   - 签名 9 参，4.19/6.1 verbatim 同构写死；第 9 参 avd 在栈上。
- *
- * 版本历史与演进记录：见 docs/selinux-hide/KPM-1.1.0-注释工作日志归档.md */
 
 #include <ksyms.h>
 #include "sehide.h"
@@ -126,55 +78,6 @@ static int se_insn_is_b(se_u32 inst)
     return (inst & 0xFC000000u) == 0x14000000u;
 }
 
-/* inbound 白名单语义：/proc/<pid> 文件类刻意保持出厂 deny——app.te
- * neverallow appdomain 访问非 app 域 file，放行文件类会让 isolated
- * helper 读到 su 域进程的 mountinfo（mountinfo 泄露面）。
- *
- * 类编号语义（机制关键）：内核存在两个类编号空间——
- *   a) 钩子层：avc_denied 收到的 tclass = secclass_map 静态序
- *      （classmap.h 编译期固化）—— 本 hook 所在层语义；
- *   b) policy 层：policydb/symtab/avtab 的类 value（设备 policy 布局，
- *      binder=49 vs 钩子层 57）。
- *   内核在 security_compute_av 内经 unmap_class + map_decision 桥接；
- *   avc_denied 调用点不做映射 —— 直收钩子层序。错用 policy 序会让
- *   inbound binder 全部失配（process/fd/fifo/us 恰好两空间同值，会
- *   掩盖错位）。
- *   类号/权限位一律按名解析：遍历内核 secclass_map（g_scm_addr，自证）
- *   按类名/权限名定位钩子层类号与位 index —— 零硬编码类号，跨
- *   policy 版本稳定。memfd_file：6.1 无此类 → 解析 0 → 规则自动失效；
- *   内核强制钩子不会发起该类请求，仅用户态 oracle 可引用。
- * （se_policydb.c 的副本 inbound stamp 含 memfd_file：副本求值走
- * policy 层语义，服务 oracle 一致性，正确。） */
-
-/* ==================== KSU 原版规则集匹配（决策面放行判据） =====
- *
- * 放行判据 = KSU 原版 apply_kernelsu_rules（KernelSU
- * kernel/selinux/rules.c:45-166 verbatim）写入 live 的规则集等效判定
- * —— 规则点名走本层特权规则（flip/副本收口），其余透传出厂 live。
- * uid 不参与本层判定（uid 只在问侧门存在）。
- *
- * 规则集 → 本层判定映射（rules.c 行号 verbatim）：
- *   G1 outbound  :88/:99  ksu permissive + allow ALL → 主干 ssid==su/comp
- *                 全类 flip（原语义，本就无 uid）；
- *   G2 inbound   :153 binder ALL / :128 fd use / :129-132 fifo_file
- *                 write/read/open/getattr / :133-137 unix_stream_socket
- *                 read/write/connectto/getopt/getattr / :119 process
- *                 sigchld（任意源）/ :156-157 system_server process
- *                 getpgid|sigkill / :118/:150 servicemanager|
- *                 hwservicemanager process getattr / :114-125+:147-149
- *                 servicemanager|logd|hwservicemanager 的 dir/file
- *                 源域限定 / :140-144 memfd_file 5perm（6.1 解析 0）；
- *   G3 目标类型  :96 domain→ksu_file ALL —— KSU 专属文件类型；KPM 生态
- *                 的对应物 = 副本盖章规则（se_stamp_*），由副本收口
- *                 承接，本层不硬编码；
- *   G4 源域全类  :110 init→ksu ALL → init 源对 su/comp 目标全类 flip。
- *
- * 位序：avc_denied 收到的 tclass/requested 均为钩子层静态序（avc_ss.h
- * secclass_map 序，4.19/6.1 逐字同构）—— 掩码按同序建立（1<<位
- * index），与 requested 直接位与。KSU 规则集不含 dyntransition/
- * transition/setcurrent → 跨域身份切换不在 A 类型内，天然透传出厂拒。
- * 未解析（类不存在/表未建）→ 掩码 0 → B 类型（fail-closed）。
- * ========================================================================== */
 
 /* KSU 规则集掩码（钩子层静态序 perm 位；0 = 未覆盖/未解析）。 */
 static se_u32 g_ksu_m_binder;        /* binder ALL（:153，任意源） */
@@ -199,50 +102,6 @@ void se_ksu_recal(void);  /* 前向声明：g_scm_addr 就绪即建 KSU 规则�
                            * 定义在本文件 KSU 段。 */
 
 static unsigned int se_orig_probe_n;  /* 生态域升级探测限频计数 */
-
-/* ==================== 副本收口查询（内核函数组合，零布局知识零扫描） ====================
- *
- * 定稿原则：内核源码级固定路径——内核自己怎么建翻译表，我们就怎么建。
- *（历史演进记录见归档 md。）
- *
- * 内核 selinux_set_mapping 的建表逻辑（verbatim，6.1 services.c:133/151 =
- * 4.19 :137/155）：
- *     p_out->value = string_to_security_class(pol, p_in->name);
- *     p_out->perms[k] = string_to_av_perm(pol, p_out->value, p_in->perms[k]);
- * 两函数均为 policydb.c 非 static 导出（policydb.h:387-388 extern 声明；
- * 6.1 policydb.c:1809/1822 = 4.19 :1810/1821 逐字同构），内核
- * kallsyms T 段可见。语义：
- *     string_to_security_class(p, name) = symtab_search(&p->p_classes,
- *                                         name)->value    —— 类名→类值
- *     string_to_av_perm(p, cls, name)   = 1<<(perdatum->value-1)
- *                                       —— 权限名→policy 位掩码
- * 第一参数是 struct policydb *——传副本 L.copy 即按副本 symtab 求值
- * （副本类定义与 live 一致：blob 吸收时类数校验兜底）。
- *
- * 钩子层语义的唯一持有者 = secclass_map（4.19/6.1 avc_ss.h 逐字同构：
- * struct { const char *name; const char *perms[sizeof(u32)*8+1]; } ——
- * 元素 8+33*8=272B，NULL 名终止；这是内核源码结构定义，非设备提取）。
- * 其地址解析不用 L1 直读（kallsyms_lookup_name 对 D 段数据符号有
- * 错地址前科，装机实证），改走 KP 导出的 kallsyms_on_each_match_symbol
- * （start.c:148 KP_EXPORT_SYMBOL verbatim：内核原函数优先 + 6.1 nomod
- * 回退，全 kallsyms 表按名精确匹配回调）——内核官方机制确定调用。
- * 地址自证：[0].name=="security" && [1].name=="process"（SELinux 架构
- * 基础类序，规范不变量）——错地址在此 fail-closed。
- *
- * 建表（se_perm_tab_build，build_copy 成功尾部调用；换代不改类定义，
- * 无需重建）：对 tclass=1..：name=scm[tclass-1].name（非法指针=表尾）→
- * g_cls_pol[tclass]=string_to_security_class(L.copy, name)；对 i=0..：
- * perm=scm[tclass-1].perms[i]（NULL=该类权限尾）→ g_perm_bit[tclass][i]=
- * string_to_av_perm(L.copy, cls_pol, perm)。与内核 mapping 同源同语义。
- *
- * 查询（se_copy_query_allow）：入参=钩子层语义。type_s/t = sidtab 查
- * type（4.19 sidtab_search 直返 context*，type@+8；5.10+ entry 形态
- * context@+8 → type@+16）；node = avtab_search_node(副本 avtab,
- * {type_s, type_t, g_cls_pol[tclass], AVTAB_ALLOWED})；放行 ⟺ requested
- * 每位 i：datum & g_perm_bit[tclass][i] 非零（副本 avtab datum=policy
- * 位序，与内核 avtab 一致；钩子层位→policy 位由本表重排）。全失败 →
- * g_tab_ready=0 fail-closed（出厂语义）。
- * ========================================================================== */
 
 #define SE_CLS_MAX   96u    /* 翻译表覆盖上限（钩子层类号安全界） */
 #define SE_SCM_SZ    272u   /* sizeof(struct security_class_mapping)
@@ -986,33 +845,6 @@ int se_decision_install(void)
         return -1;
     }
 
-    /* 入口两态判定：
-     *
-     *   态① KP 补丁在岗 → **avc_denied 直挂 + KP replace 保留为链上
-     *        下一跳**（终态）：备份 KP pad 5/4 词（仅卸载恢复用，不再
-     *        被执行）；补丁写 avc_denied（内核 text = 实测稳定写入面）；
-     *        trampoline = [LDR/BR/quad(kp_replace)] 纯重定向 4 词——
-     *        不复制、不跳过任何指令，kp_replace 从其真实入口原样执行
-     *        （KP task_ext 按任务授予完整保留）。
-     *        红线（为什么补丁落点回到 avc_denied 内核 text，kpimg 零
-     *        写入）：patch_map 对 KP 分配 VA（kpimg/KPM 映射区，运行时
-     *        基址每次 boot 由 KP 自选）的地址翻译不可靠 → 写入落错
-     *        物理页 → 随机内核 text 损坏（pstore 三信号收敛，见归档
-     *        md）。唯一实测稳定面 = 内核 text（avc_denied）+ 本模块
-     *        .text。
-     *   态② 原始入口（KP bypass 未装机）→ direct 接管：备份原始前缀、
-     *        补丁写 avc_denied。原始入口首指令需过序言白名单（错地址
-     *        第二道防线）。
-     *
-     * 非特权纯度（共存形态）：avc_denied → KP pad → KP replace → 我们
-     * 补丁 → 判定（KSU 规则集/副本匹配，未命中）→ KP replace 主体 →
-     * 原函数。KP replace 对非特权 = 只读判定、零结果改变，且该 hop
-     * 自 KP 开机起就在非特权的 deny 路径上（宿主既有行为）。
-     *
-     * KP 补丁形态（hook.c:309-316 + hook_prepare:561-567 verbatim）：
-     *   A: [0]=0xd50324df BTI JC, [1]=0x58000051 LDR X17,#8,
-     *      [2]=0xd61f0220 BR X17, [3:4]=quad（内核函数带 PAC 序言时）
-     *   B: [0]=0x58000051 LDR X17,#8, [1]=0xd61f0220 BR X17, [2:3]=quad */
     {
         se_u32 e[3] = {0, 0, 0};
 
