@@ -3,12 +3,12 @@
 #include "sehide.h"
 
 KPM_NAME("SELinux_hide_Ind");
-KPM_VERSION("1.1.1");
+KPM_VERSION("1.1.2");
 KPM_LICENSE("AGPL v3");
 KPM_AUTHOR("Lun.");
 KPM_DESCRIPTION("github@Lun-OS ; Built-in the boot to achieve cleaner SELinux_hide");
 
-static const char *se_ver = "1.1.0";
+static const char *se_ver = "1.1.2";
 
 long sehide_init(const char *args, const char *event, void *__user reserved)
 {
@@ -26,11 +26,21 @@ long sehide_init(const char *args, const char *event, void *__user reserved)
        失败关影子页子系统 */
     se_shadow_init();
 
+    /* 旗排水 worker：重活（recal/build_copy/avc flush）移出写入路径。
+       启动失败时门内原地排水回退（行为同 1.1.1）。 */
+    if (se_recal_worker_start())
+        pr_info("sehide: recal worker unavailable, inline drain fallback\n");
+
     for (i = 0; i < NSYM; i++)
         pr_info("sehide: %-26s %016lx %s\n", syms[i].name, syms[i].addr,
                 syms[i].addr ? "ok" : "MISSING");
 
     if (!p_read_policy || !p_pdb_read || !p_kread || !p_kvzalloc || !p_selinux_state) {
+        if (!p_selinux_state)
+            /* D 段符号缺失（kallsyms.c:373 IS_ENABLED(CONFIG_KALLSYMS_ALL)
+             * 决定覆盖 _end/_etext）——非加固异常，按部署条件提示。 */
+            pr_info("sehide: selinux_state (D-segment) missing — "
+                    "kernel needs CONFIG_KALLSYMS_ALL=y, or CTL0: sym_state <addr16hex>\n");
         pr_info("sehide: required symbol missing, engine off\n");
         return 0;
     }
@@ -185,11 +195,43 @@ int se_install_engine(void)
 
 static long se_ctl_sepolicy(const char *path);   /* 改① 入口，定义在下方 */
 
+/* CTL0 "sym_state <16位hex>"：手工注入 selinux_state 地址。
+ * 仅 KALLSYMS_ALL=n 机型需要；错址由标定自检（se_locate 唯一锚点）
+ * fail-safe 拒收。 */
+static long se_ctl_sym_state(const char *hex)
+{
+    unsigned long addr = 0;
+    unsigned int i;
+
+    if (!se_gate_privileged())
+        return -1;
+    if (strlen(hex) != 16u)
+        return -22;
+    for (i = 0; i < 16u; i++) {
+        char c = hex[i];
+
+        addr <<= 4;
+        if (c >= '0' && c <= '9')
+            addr |= (unsigned long)(c - '0');
+        else if (c >= 'a' && c <= 'f')
+            addr |= (unsigned long)(c - 'a' + 10u);
+        else if (c >= 'A' && c <= 'F')
+            addr |= (unsigned long)(c - 'A' + 10u);
+        else
+            return -22;
+    }
+    return se_sym_set_state(addr);
+}
+
 long sehide_control0(const char *args, char *__user out_msg, int outlen)
 {
     /* sepolicy 批处理子命令分发（诊断输出走 else） */
     if (args && args[0] == 's' && !strncmp(args, "sepolicy ", 9))
         return se_ctl_sepolicy(args + 9);
+
+    /* selinux_state 手工注入（KALLSYMS_ALL=n 机型） */
+    if (args && args[0] == 's' && !strncmp(args, "sym_state ", 10))
+        return se_ctl_sym_state(args + 10);
 
     /* 诊断子命令："probe" 手动触发 avtab 探针（写一次内核 .text，仅供
      * 取证）；"shadow" 打印影子页坐标系状态 */
@@ -325,6 +367,9 @@ long sehide_exit(void *__user reserved)
 {
     (void)reserved;
     pr_info("sehide: exit\n");
+
+    /* 先停旗排水 worker（其回调引用模块内存，必须最先退出） */
+    se_recal_worker_stop();
 
     /* 影子页还原（BBM 换回原描述符 + 释放影子页） */
     se_shadow_remove_all();

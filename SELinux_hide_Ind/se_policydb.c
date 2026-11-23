@@ -552,6 +552,61 @@ static int role_pass(const se_u8 *pdb, se_u32 off, se_u32 nroles)
     return 0;
 }
 
+/*
+ * 4.19 系条件规则求值（复数版 evaluate_cond_nodes 不存在，仅单数
+ * evaluate_cond_node(p, node)，conditional.h:80/conditional.c:90）。
+ * 偏移链按 4.19 policydb.h 字段序推导（SYM_NUM=8，sizeof=488 与标定
+ * 互证）：cond_list = lenoff-136、permissive_map = lenoff-16、
+ * te_avtab = lenoff-232。三重自检任一失败即弃用（保持 false 分支
+ * fail-closed 现状），绝不带错偏移求值。bool 态由 policydb_read 的
+ * cond_read_bool 从二进制置入（conditional.c:233），与 live 一致。
+ * 求值循环对齐内核 security_load_policy（services.c:2901-2905）。
+ */
+static void se_eval_conds_419(void *buf)
+{
+    void *cur = 0, *head = 0;
+    se_u32 n = 0;
+    static int diag;
+
+    if (!L.lenoff || L.symtab_stride != 16u ||
+        L.avtab_off != L.lenoff - 232u ||
+        L.perm != L.lenoff - 16u ||
+        L.lenoff < 136u)
+        return;
+    if (se_kread(&head, (se_u8 *)buf + L.lenoff - 136u, 8) ||
+        (head && !se_kptr_ok((se_u64)(se_ulong)head)))
+        return;
+
+    for (cur = head; cur; ) {
+        void *expr = 0, *next = 0;
+        int rc, st = 0;
+
+        if (++n > 65536u) {
+            if (diag < 3) { diag++; pr_info("sehide: cond walker runaway, abort\n"); }
+            return;
+        }
+        if (se_kread(&expr, (se_u8 *)cur + 8u, 8) || !expr ||
+            !se_kptr_ok((se_u64)(se_ulong)expr))
+            return;                     /* expr 失形：布局漂移，弃用 */
+        rc = ((int (*)(void *, void *))p_eval_cond_node)(buf, cur);
+        if (rc || se_kread(&st, cur, 4) || (st != 0 && st != 1)) {
+            if (diag < 3) {
+                diag++;
+                pr_info("sehide: cond walker eval rc=%d st=%d, stop\n", rc, st);
+            }
+            return;                     /* 未求值节点保持 false（fail-closed） */
+        }
+        if (se_kread(&next, (se_u8 *)cur + 32u, 8) ||
+            (next && !se_kptr_ok((se_u64)(se_ulong)next)))
+            return;
+        cur = next;
+    }
+    if (n && diag < 3) {
+        diag++;
+        pr_info("sehide: cond walker ok nodes=%u\n", n);
+    }
+}
+
 static void se_stamp_copy_extras(void *buf, se_u32 comp_type)
 {
     /* inbound 半边盖章（特权 oracle 一致性）—— 与决策面 inbound 语义
@@ -583,9 +638,12 @@ static void se_stamp_copy_extras(void *buf, se_u32 comp_type)
         se_set_permissive(buf, L.perm, L.su_type);
 
     /* 对齐内核 security_load_policy 流程（services.c:3132
-     * policydb_read 之后调 evaluate_cond_nodes）。幂等防御性重评估。 */
+     * policydb_read 之后调 evaluate_cond_nodes）。幂等防御性重评估。
+     * 4.19/小米树无复数版 → 单数 walker（偏移自检失败自动弃用）。 */
     if (p_eval_conds)
         ((void (*)(void *))p_eval_conds)(buf);
+    else if (p_eval_cond_node)
+        se_eval_conds_419(buf);
 }
 
 /*

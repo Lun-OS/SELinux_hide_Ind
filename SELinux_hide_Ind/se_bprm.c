@@ -315,8 +315,17 @@ static void se_switch_to_su(void *bprm)
 
     rc = ((int (*)(void *, se_u32))p_set_sec_override)
         ((void *)(se_ulong)cred, tgt);
-    pr_info("sehide: component exec -> %s domain (uid0 /data/adb) rc=%d\n",
-            g_comp_ctx, rc);
+    /* 成功是预期行为，静默（生态组件 exec 频率高，逐条打印会冲刷日志）；
+     * 仅失败限频诊断。 */
+    if (rc) {
+        static int swf_n;
+
+        if (swf_n < 4) {
+            swf_n++;
+            pr_info("sehide: component exec -> %s domain rc=%d\n",
+                    g_comp_ctx, rc);
+        }
+    }
 }
 
 int se_bprm_wrap(void *bprm)
@@ -353,18 +362,30 @@ int se_bprm_wrap(void *bprm)
     /*
      * live 重载（KP 6.5s / 模块 /load）后副本换代自愈：指纹三读三比，
      * 变了才重标定，未变零开销。
+     *
+     * 资源隔离红线：本块仅特权（uid<10000）执行。非特权答案恒为
+     * 内核原函数（live 本身即出厂，副本陈旧不改变其视图），指纹
+     * 读/旗排水与非特权透传链零交集；周期兜底由 recal worker 承担
+     * （se_recal.c 巡检），此处仅保留特权路径的即时排水。
      */
-    /* 决策面（RCU 读临界区）只置旗，exec 点（进程上下文）
-     * 代跑——自愈晚一个周期。 */
-    if (g_recal_pending) {
-        g_recal_pending = 0;
-        se_recalibrate();
-    } else if (!se_live_ok()) {
-        se_recalibrate();
-    }
-    if (g_comp_pending) {
-        g_comp_pending = 0;
-        se_comp_upgrade();
+    /* 排水只清旗，重活归 recal worker（毛刺修复）；决策面（RCU 读临界区）
+     * 置旗语义不变。 */
+    if (se_gate_privileged()) {
+        if (g_recal_pending) {
+            g_recal_pending = 0;
+            if (!g_recal_worker_ready)
+                se_recalibrate();
+        } else if (!se_live_ok()) {
+            if (g_recal_worker_ready)
+                g_recal_pending = 1;
+            else
+                se_recalibrate();
+        }
+        if (g_comp_pending) {
+            g_comp_pending = 0;
+            if (!g_recal_worker_ready)
+                se_comp_upgrade();
+        }
     }
 
     {

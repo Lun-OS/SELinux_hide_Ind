@@ -27,7 +27,6 @@ void se_recalibrate(void);
 int se_live_ok(void)
 {
     se_u64 container = 0;
-    se_u32 len = 0, pv = 0;
 
     if (!p_selinux_state || !L.ok)
         return 0;
@@ -35,13 +34,16 @@ int se_live_ok(void)
         return 0;
     if ((void *)(se_ulong)container != L.container)
         return 0;
-    if (se_kread(&len, (se_u8 *)L.pdb + L.lenoff, 4))
-        return 0;
-    if (len != L.bin_len)
-        return 0;
-    if (se_kread(&pv, (se_u8 *)L.pdb + L.lenoff + 8u, 4))
-        return 0;
-    return pv == L.vers;
+    /* len(u64@lenoff) 低 32 位 + vers(u32@lenoff+8) 合并单次读 */
+    {
+        se_u8 lv[12];
+
+        if (se_kread(lv, (se_u8 *)L.pdb + L.lenoff, 12))
+            return 0;
+        if (se_rd32(lv) != L.bin_len)
+            return 0;
+        return se_rd32(lv + 8) == L.vers;
+    }
 }
 
 /*
@@ -342,4 +344,132 @@ bad:
     g_degraded = 1;
     g_recal_busy = 0;
     pr_info("sehide: recalibrate failed rc=%d, gates fallback to kernel\n", rc);
+}
+
+/* ---------------- 旗排水 worker ----------------
+ * 门/bprm 写入路径只清旗；recal/build_copy/avc flush 等重活全部移到
+ * 本线程执行，避免重活落在探针/普通写入调用内（时序毛刺根因）。
+ * 符号缺失时 worker 不启动，门内原地排水回退（行为同 1.1.1）。 */
+
+static void *g_recal_task;
+int g_recal_worker_ready;
+static int g_recal_pin_done;   /* start 期绑核已成功（fn 不再重复尝试） */
+
+/*
+ * kthread 绑核：把模块自有 kthread 钉在单核，调度干扰集中到该核，
+ * 不再随机落在任意 CPU 抢占透传链（+1145us 离群根因）。
+ * 目标 = CPU7（8 核机型的 prime 核惯例）；不在位（4 核/命名差异）
+ * 则不绑核，保持旧行为。cpumask 按位图传参：栈上 256B 零填充，
+ * 覆盖 ≤2048 CPU 的位图宽度，读取越界面为零。
+ */
+int se_worker_pin(const char *tag, void *t)
+{
+    unsigned long mask[32];
+    int rc;
+
+    if (!t || !p_set_cpus_allowed_ptr)
+        return -1;
+    memset(mask, 0, sizeof(mask));
+    mask[7 / (sizeof(unsigned long) * 8u)] =
+        1ul << (7u % (sizeof(unsigned long) * 8u));
+    rc = ((int (*)(void *, const void *))p_set_cpus_allowed_ptr)(t, mask);
+    pr_info("sehide: %s pinned to cpu7 rc=%d\n", tag, rc);
+    return rc;
+}
+
+static int se_recal_worker_fn(void *arg)
+{
+    unsigned int tick = 0;
+    int pin_rc;
+    unsigned int pin_try = 0;
+    unsigned int status_try = 0;
+
+    /* 自身 task_struct 取自 g_recal_task（start 在 wake 前已赋值，
+     * 首次循环必然可见）。绑核在 create 期可能撞 CPU7 尚未 online
+     * （4.19 core.c:1083 唯一 EINVAL 路径：cpumask_any_and
+     * (cpu_online_mask) 无交集——启动期逐核上线晚于 sehide_init），
+     * 此处周期重试直到成功；30 次（~30s）封顶后放弃。 */
+    /* start 期已成功绑核则跳过首循环补试（消重：此前同一次启动打
+     * 两条 pinned 日志）；未成功才补试，之后周期重试 30 次封顶。 */
+    pin_rc = g_recal_pin_done ? 0 :
+             (g_recal_task ? se_worker_pin("recal worker", g_recal_task) : -1);
+    while (!((int (*)(void))p_kthread_should_stop)()) {
+        int busy = 0;
+
+        ++tick;
+        if (pin_rc && pin_try < 30u && (tick & 0x7fu) == 0u) {
+            pin_try++;
+            pin_rc = se_worker_pin("recal worker", g_recal_task);
+        }
+
+        if (g_recal_pending) {
+            g_recal_pending = 0;
+            se_recalibrate();
+            busy = 1;
+        }
+        if (g_comp_pending) {
+            g_comp_pending = 0;
+            se_comp_upgrade();
+            busy = 1;
+        }
+        /* 静默监控：透传链/deny 路径已无任何探测与指纹检查，
+         * 指纹自愈与组件域升级由本线程周期巡检完成（进程上下文，
+         * 可睡眠；~512 个空闲轮 × 8ms ≈ 4.1s 一次）。旗置位事件
+         * （决策面/门）仍即时响应，巡检只兜底无事件窗口。 */
+        if ((tick & 0x1ffu) == 0u && L.ok && !g_degraded) {
+            if (!se_live_ok())
+                se_recalibrate();
+            else
+                se_comp_upgrade();
+        }
+        /* status freeze 延迟补装：selinuxfs 挂载可能晚于首个 exec
+         * （OP60F9L1 实证 3.7s 内核态读 enforce 失败）；安装本身只做
+         * 文件读 + 数据槽写，进程上下文安全。巡检节拍 ~4.1s，5 次封顶。 */
+        if (status_try < 5u && (tick & 0x1ffu) == 0u && L.ok &&
+            !se_status_ready()) {
+            status_try++;
+            /* -20 = 内核 read 原语不支持 selinuxfs（确定性）——立即停
+             * 止重试，避免每 ~4s 重复打印内核 WARN；open 失败(-2)才是
+             * 挂载时序问题，保留重试。 */
+            if (se_status_install() == -20)
+                status_try = 99u;
+        }
+        if (!busy)
+            ((void (*)(se_ulong))p_msleep_interruptible)(8);
+    }
+    return 0;
+}
+
+int se_recal_worker_start(void)
+{
+    void *t;
+
+    if (g_recal_task)
+        return 0;
+    if (!p_kthread_create_on_node || !p_wake_up_process ||
+        !p_kthread_should_stop || !p_msleep_interruptible || !p_kthread_stop)
+        return -1;
+    t = ((void *(*)(int (*)(void *), void *, int, const char *, ...))
+         p_kthread_create_on_node)(se_recal_worker_fn, 0, -1, "sehide_recal");
+    if (!t || (se_ulong)t >= (se_ulong)-4095L)
+        return -1;
+    g_recal_task = t;
+    g_recal_worker_ready = 1;
+    /* start 期绑核；成功登记 g_recal_pin_done，fn 首循环不再重复
+     * （消重）。失败留给 fn 自重试（CPU7 未 online 场景）。 */
+    if (!se_worker_pin("recal worker", t))
+        g_recal_pin_done = 1;
+    ((int (*)(void *))p_wake_up_process)(t);
+    pr_info("sehide: recal worker started\n");
+    return 0;
+}
+
+void se_recal_worker_stop(void)
+{
+    if (!g_recal_worker_ready || !g_recal_task)
+        return;
+    ((int (*)(void *))p_kthread_stop)(g_recal_task);
+    g_recal_task = 0;
+    g_recal_worker_ready = 0;
+    pr_info("sehide: recal worker stopped\n");
 }

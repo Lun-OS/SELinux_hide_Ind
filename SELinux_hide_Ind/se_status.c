@@ -80,6 +80,11 @@ long se_status_read(void *file, char *ubuf, se_ulong count, se_u64 *ppos)
         (file, ubuf, count, ppos);
 }
 
+int se_status_ready(void)
+{
+    return g_status_ready;
+}
+
 int se_status_install(void)
 {
     se_u32 enforcing = 0, deny_unknown = 0;
@@ -94,14 +99,27 @@ int se_status_install(void)
     if (!p_filp_open || !p_kernel_read || !p_filp_close)
         return -1;
 
-    if (se_read_u32_node("/sys/fs/selinux/enforce", &enforcing) ||
-        enforcing > 1u) {
-        pr_info("sehide: status freeze off (enforce read rc)\n");
-        return -2;
+    {
+        int rc2 = se_read_u32_node("/sys/fs/selinux/enforce", &enforcing);
+
+        if (rc2 || enforcing > 1u) {
+            pr_info("sehide: status freeze off (enforce rc=%d val=%u)\n",
+                    rc2, enforcing);
+            /* rc=-3 = kernel_read 返回失败：6.1 起 __kernel_read 强制
+             * read_iter 且拒绝纯 .read 文件（fs/read_write.c:422），
+             * selinuxfs 全部节点只有 .read —— 确定性失败，-20 通知
+             * 调用方停止重试（瞬时挂载时序问题只体现为 open -2）。 */
+            return rc2 == -3 ? -20 : -2;
+        }
     }
-    if (se_read_u32_node("/sys/fs/selinux/deny_unknown", &deny_unknown)) {
-        pr_info("sehide: status freeze off (deny_unknown read rc)\n");
-        return -3;
+    {
+        int rc2 = se_read_u32_node("/sys/fs/selinux/deny_unknown",
+                                   &deny_unknown);
+
+        if (rc2) {
+            pr_info("sehide: status freeze off (deny_unknown rc=%d)\n", rc2);
+            return -3;
+        }
     }
 
     se_wr32(g_frozen + 0, 1u);            /* version */

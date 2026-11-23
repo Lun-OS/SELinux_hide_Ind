@@ -32,26 +32,28 @@ long se_access_write(void *file, char *ubuf, se_ulong size)
 
     (void)file;
 
-    /* 策略可能在安装之后被重载（见 se_live_ok），先保证 live 是新的。
-     * 决策面置旗的待办在此代跑（本点=进程上下文）。 */
+    /* 非特权透传零开销：答案由内核实时计算，与副本/指纹无关——
+     * 指纹巡检与旗排水仅特权路径执行（威胁面=非特权）。 */
+    if (!se_gate_privileged())
+        goto fallback;
+
+    /* 特权：旗清点（清旗即可，重活归 worker）+ 指纹巡检 */
     if (g_recal_pending) {
         g_recal_pending = 0;
-        se_recalibrate();
+        if (!g_recal_worker_ready)
+            se_recalibrate();
     } else if (!se_live_ok()) {
-        se_recalibrate();
+        if (g_recal_worker_ready)
+            g_recal_pending = 1;
+        else
+            se_recalibrate();
     }
     if (g_comp_pending) {
         g_comp_pending = 0;
-        se_comp_upgrade();
+        if (!g_recal_worker_ready)
+            se_comp_upgrade();
     }
     if (g_degraded)
-        goto fallback;
-
-    /*
-     * 门分流：特权（uid<10000）答副本（出厂基底 + 盖章，内核原生求值）；
-     * 非特权直通内核原版对 live 求值 —— 直通答案与未 root 逐位一致。
-     */
-    if (!se_gate_privileged())
         goto fallback;
 
     if (size == 0 || size >= sizeof(kbuf))
@@ -217,23 +219,28 @@ long se_context_write(void *file, char *ubuf, se_ulong size)
 
     (void)file;
 
-    /* 同 /access——决策面置旗待办在此代跑。 */
+    /* 非特权透传零开销（同 /access）；特权才做旗清点与指纹巡检。 */
+    if (!se_gate_privileged())
+        goto fallback;
+
     if (g_recal_pending) {
         g_recal_pending = 0;
-        se_recalibrate();
+        if (!g_recal_worker_ready)
+            se_recalibrate();
     } else if (!se_live_ok()) {
-        se_recalibrate();
+        if (g_recal_worker_ready)
+            g_recal_pending = 1;
+        else
+            se_recalibrate();
     }
     if (g_comp_pending) {
         g_comp_pending = 0;
-        se_comp_upgrade();
+        if (!g_recal_worker_ready)
+            se_comp_upgrade();
     }
     if (g_degraded)
         goto fallback;
 
-    /* uid 分流（与 /access 同款） */
-    if (!se_gate_privileged())
-        goto fallback;
     if (size == 0 || size >= sizeof(kbuf))
         return -22;   /* 出厂同款 EINVAL */
     /*
@@ -329,16 +336,29 @@ static void *se_load_pend;
 static se_u32 se_load_pend_len;
 static se_u32 se_load_busy;         /* 0=空 1=线程持有 2=待处理 */
 static void *se_load_task;
+static int se_load_pin_rc;
+static unsigned int se_load_pin_try;
 
 static int se_load_worker_fn(void *arg)
 {
     (void)arg;
+    /* 绑核：start 期未成功（rc!=0 或未尝试）才在首循环补试；之后
+     * 空转轮询期周期重试，30 次封顶。自身 task = se_load_task
+     * （start 在 wake 前已赋值）。 */
+    if (!se_load_pin_try)
+        se_load_pin_rc = se_load_task ?
+            se_worker_pin("load worker", se_load_task) : -1;
     while (!((int (*)(void))p_kthread_should_stop)()) {
         se_u8 *blob;
         se_u32 len;
         int rc;
 
         if (!se_cas32(&se_load_busy, 2, 1)) {
+            if (se_load_pin_rc && se_load_pin_try < 30u) {
+                se_load_pin_try++;
+                se_load_pin_rc =
+                    se_worker_pin("load worker", se_load_task);
+            }
             ((void (*)(se_ulong))p_msleep_interruptible)(2);
             continue;
         }
@@ -371,6 +391,12 @@ int se_load_worker_start(void)
     if (!t || (se_ulong)t >= (se_ulong)-4095L)
         return -1;
     se_load_task = t;
+    /* start 期绑核；成功则登记 999 封顶，worker 首循环不再重复尝试
+     * （消重：此前同一次启动会打印两条 pinned 日志）。失败留给
+     * worker 自重试（CPU7 未 online 场景）。 */
+    se_load_pin_rc = se_worker_pin("load worker", t);
+    if (!se_load_pin_rc)
+        se_load_pin_try = 999u;
     ((int (*)(void *))p_wake_up_process)(t);
     return 0;
 }
@@ -516,6 +542,7 @@ static int g_rp_finode_off = -1;         /* filp->f_inode 偏移（标定缓存�
 static int g_rp_isize_off = -1;          /* inode->i_size 偏移（标定缓存） */
 static int g_rp_off_ready;
 int g_rp_served;                          /* 自测命中计数 */
+static int g_rp_test_busy;                /* 自测遇 recal busy（安装自身持锁，非槽指错） */
 
 /* 在 [obj, obj+span) 内找 8 对齐的指针槽：指向"前 8B == magic"的堆块。
  * 返回槽偏移；-1=未找到。内容自证（magic=L.bin_len 全系统唯一）。 */
@@ -664,6 +691,9 @@ long se_policy_open_hook(void *inode, void *filp)
          * （/policy 读低频，可接受）。 */
         if (!se_cas32(&g_recal_busy, 0, 1)) {
             ((void (*)(void *))p_vfree)(nd);
+            /* 安装路径自身持 g_recal_busy（bprm 首触）→ 自测必走此分支；
+             * 标记给 selftest 区分"忙"与"槽指错"，避免读门被误杀。 */
+            g_rp_test_busy = 1;
             pr_info("sehide: rp mirror busy, serve stock snapshot\n");
             return rc;
         }
@@ -751,7 +781,7 @@ int se_install_read_gate(void)
         if (f && se_kptr_ok((se_u64)(se_ulong)f)) {
             ((void (*)(void *, void *))p_filp_close)(f, (void *)0);
             pr_info("sehide: rp selftest done (served=%d)\n", g_rp_served);
-            if (!g_rp_served) {
+            if (!g_rp_served && !g_rp_test_busy) {
                 void *rb = 0;
 
                 SE_FPHOOK((void *)(ops + off), bak, &rb);
@@ -760,6 +790,9 @@ int se_install_read_gate(void)
                         "(degraded)\n");
                 return -7;
             }
+            /* busy 期间未能 served（安装自身持 recal 锁）：保留门，
+             * 由真实 /policy 流量自然验证；MISS 才降级。 */
+            g_rp_test_busy = 0;
             g_rp_served = 0;
         } else {
             pr_info("sehide: rp selftest open failed (env), "

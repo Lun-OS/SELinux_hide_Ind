@@ -35,11 +35,12 @@ int walk_cb(void *data, const char *name, struct module *mod, unsigned long addr
  *
  * 三级顺序固定、谁通谁生效：
  *   L1  内核 kallsyms_lookup_name（KP 填的指针）—— 4.19 等一级命中；
- *   L2  内核 kallsyms_on_each_symbol 遍历 —— 仅 kver<5.10 保守启用。
- *       walk_cb 是 4 参回调（带 struct module *）；主线在 v6.4 才把回调
- *       改成 3 参（kernel/kallsyms.c v6.3:291 vs v6.4:291，不是旧注写的 6.6）。
- *       5.10-6.3 本可继续用 4 参回调，但为不扩大未实机验证的路径，
- *       保持原有「5.10+ 交 L3」的保守划分。
+ *   L2  内核 kallsyms_on_each_symbol 遍历 —— kver<6.4 启用。
+ *       walk_cb 是 4 参回调（带 struct module *）；主线 v6.4 把回调改成
+ *       3 参（4.19:178/5.10:207/6.1:290 均四参 verbatim，6.6:288 三参），
+ *       故门限 = <6.4。旧注「6.1 无此符号」为误判：6.1 kallsyms.c:290
+ *       存在 4 参版本（kernel/kallsyms.c 注释仅指模块遍历改走
+ *       module_kallsyms_on_each_symbol），本机 6.1 树实证。
  *   L3  KP 的 kallsyms_lookup_name_by_suffix —— KP 符号表导出，
  *       KP 内部已做签名适配，GKI 6.x 实证可用。
  * 全失败返回 0（引擎照旧安全 off），任一级成功即用。
@@ -58,7 +59,7 @@ unsigned long se_sym(const char *name)
             return addr;
     }
 
-    if (kver < SE_KVER_510 && kallsyms_on_each_symbol) {
+    if (kver < SE_KVER_64 && kallsyms_on_each_symbol) {
         struct walk_ctx ctx;
 
         ctx.base = name;
@@ -86,9 +87,8 @@ unsigned long se_sym(const char *name)
      * 6.1 GKI ThinLTO 把内核 static 符号重命名为 "<name>.<partition>"——
      * 本机实证 context_struct_compute_av -> "context_struct_compute_av.72"
      * （设备 kallsyms.txt t 段 verbatim），精确名与 .llvm 回退均不命中。
-     * 6.1 无 kallsyms_on_each_symbol（kallsyms.c:288 注释：
-     * "use module_kallsyms_on_each_symbol instead"——模块版够不到内核 t 段），
-     * 内核 kallsyms_lookup_name 有符号本体（T 段）但无导出。
+     * 6.1 kallsyms_on_each_symbol 实际存在（kallsyms.c:290 四参，旧注
+     * 误判），此处枚举仅为 L1/L2 精确名与后缀遍历均未命中的兜底。
      *
      * 枚举 "<name>.0" .. "<name>.999" 走 KP 填的 kallsyms_lookup_name
      * （install 一次性，最坏 1000 次二分查询，微秒级）；命中即校验
@@ -198,6 +198,7 @@ void se_sym_fill(struct sym_slot *s)
 unsigned long p_read_policy;
 unsigned long p_pdb_read;
 unsigned long p_eval_conds;   /* evaluate_cond_nodes */
+unsigned long p_eval_cond_node; /* evaluate_cond_node（4.19 单数版） */
 unsigned long p_kwrite;       /* copy_to_kernel_nofault */
 unsigned long p_adenied;      /* avc_denied 最终地址（经 patch_config 链解析） */
 unsigned long p_adenied_l3;   /* L3 直查的 avc_denied（与 patch_config 互证备用） */
@@ -213,7 +214,9 @@ unsigned long p_hashtab_ins;
 unsigned long p_kthread_create_on_node;
 unsigned long p_wake_up_process;
 unsigned long p_kthread_should_stop;
+unsigned long p_kthread_stop;
 unsigned long p_msleep_interruptible;
+unsigned long p_set_cpus_allowed_ptr;
 unsigned long p_flex_prealloc;
 unsigned long p_flex_get;
 unsigned long p_ctx_to_str;
@@ -347,6 +350,29 @@ unsigned long p_swapper;
 unsigned long p_text;
 
 /* 新增：符号绑定自 sehide_init 抽出（原 L2967-3035，纯搬移 + 死符号清理 + 新增绑定） */
+
+/*
+ * selinux_state 手工注入通道（KALLSYMS_ALL=n 机型：D 段地址不进
+ * kallsyms 表——kernel/kallsyms.c:373 覆盖 _etext 而非 _end，内核内
+ * 任何表都没有该地址，软件无法回退）。地址来源 = 同版本内核带
+ * KALLSYMS_ALL 的 System.map。正确性由下游标定自检兜底：se_locate
+ * 扫 32 槽找 policydb 锚点（len/vers 与二进制同源互证）+ 唯一命中，
+ * 错址 = 标定失败 = 引擎 off，fail-safe。
+ */
+static unsigned long g_st_override;
+
+int se_sym_set_state(unsigned long addr)
+{
+    if ((addr >> 48u) != 0xffffu || addr == 0xfffffffffffffffful)
+        return -1;                       /* 非内核地址形态 */
+    if (L.ok)
+        return -2;                       /* 已标定：地址已由锚点实证，不接受覆盖 */
+    g_st_override = addr;
+    p_selinux_state = addr;
+    pr_info("sehide: selinux_state overridden to %016lx\n", addr);
+    return 0;
+}
+
 void se_bind_symbols(void)
 {
     unsigned int i;
@@ -355,6 +381,8 @@ void se_bind_symbols(void)
         se_sym_fill(&syms[i]);
 
     p_selinux_state  = se_sym("selinux_state");
+    if (!p_selinux_state && g_st_override)
+        p_selinux_state = g_st_override;   /* CTL0 注入优先（绑定先于注入时恒空） */
     p_read_policy    = se_sym("security_read_policy");
     p_pdb_read       = se_sym("policydb_read");
     /* 副本条件规则状态初始化原语。内核 security_load_policy 在
@@ -363,6 +391,9 @@ void se_bind_symbols(void)
      * 则条件规则恒取 false 分支，非 su 特权查询的副本答案与 live 不一致。
      * 设备 kallsyms T 段全局符号（verbatim），同样登记 LTO 后缀枚举保险。 */
     p_eval_conds     = se_sym("evaluate_cond_nodes");
+    /* 4.19/小米树无复数版（conditional.c:90 只有单数双参
+     * evaluate_cond_node(p, node)），副本条件规则求值走 4.19 walker。 */
+    p_eval_cond_node = se_sym("evaluate_cond_node");
     /* 门输出方向的安全写原语（transaction 的响应页是内核地址，
      * copy_to_user 对其必 EFAULT——与输入方向 strncpy_from_user 同源的错误，
      * 设备 kallsyms T 段全局 verbatim）。 */
@@ -428,7 +459,11 @@ void se_bind_symbols(void)
     p_kthread_create_on_node = se_sym("kthread_create_on_node");
     p_wake_up_process        = se_sym("wake_up_process");
     p_kthread_should_stop    = se_sym("kthread_should_stop");
+    p_kthread_stop           = se_sym("kthread_stop");
     p_msleep_interruptible   = se_sym("msleep_interruptible");  /* ss/hashtab.c 非静态，kallsyms T */
+    /* set_cpus_allowed_ptr：sched/core.c 全局 T（4.19:1125 / 5.10:2080 /
+     * 6.1:2985 / 6.6:3223 实证）。缺符号 = 不绑核，行为同旧版。 */
+    p_set_cpus_allowed_ptr   = se_sym("set_cpus_allowed_ptr");
     p_flex_prealloc  = se_sym("flex_array_prealloc");  /* 设备 kallsyms T 实证 */
     p_flex_get       = se_sym("flex_array_get");       /* 同上 */
     p_get_bit        = se_sym("ebitmap_get_bit");

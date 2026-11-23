@@ -217,7 +217,8 @@ extern struct se_calib L;
 /* ---------------- 符号槽（定义 se_symbol.c） ---------------- */
 extern unsigned long p_read_policy;
 extern unsigned long p_pdb_read;
-extern unsigned long p_eval_conds;   /* evaluate_cond_nodes（副本条件规则状态初始化） */
+extern unsigned long p_eval_conds;   /* evaluate_cond_nodes（5.10+，复数版） */
+extern unsigned long p_eval_cond_node; /* evaluate_cond_node（4.19 单数版） */
 extern unsigned long p_kwrite;       /* copy_to_kernel_nofault（门输出写内核页） */
 extern unsigned long p_adenied;      /* avc_denied 最终地址（经 patch_config 链解析） */
 extern unsigned long p_adenied_l3;   /* L3 直查 avc_denied（互证备用） */
@@ -232,7 +233,9 @@ extern unsigned long p_hashtab_ins;
 extern unsigned long p_kthread_create_on_node;
 extern unsigned long p_wake_up_process;
 extern unsigned long p_kthread_should_stop;
+extern unsigned long p_kthread_stop;
 extern unsigned long p_msleep_interruptible;   /* blob 类型声明注入 live symtab */
+extern unsigned long p_set_cpus_allowed_ptr;   /* kthread 绑核（调度隔离，4.19~6.6 core.c T 段实证） */
 extern unsigned long p_flex_prealloc; /* type_attr_map_array 扩容（policydb_write 序列化安全） */
 extern unsigned long p_flex_get;      /* 新槽定位（导出真函数，4.19 kallsyms T） */
 extern unsigned long p_ctx_to_str;
@@ -322,6 +325,7 @@ int se_parse3(char *buf, char **a, char **b, char **c);
 unsigned long se_sym(const char *name);
 void se_sym_fill(struct sym_slot *s);
 void se_bind_symbols(void);
+int se_sym_set_state(unsigned long addr);   /* CTL0 注入 selinux_state 地址（KALLSYMS_ALL=n 机型） */
 
 /* ---------------- se_layout.c ---------------- */
 int se_read_policy(void **out, se_ulong *out_len);
@@ -419,6 +423,7 @@ void se_uninstall_hook(void);                                /* 卸载还原 bpr
 extern unsigned long p_sel_read_status;
 extern unsigned long p_status_ops;
 int se_status_install(void);
+int se_status_ready(void);
 int se_install_read_gate(void);  /* /policy 读门——特权读策略答副本序列化 */
 unsigned long se_sym_via_enum(const char *name);  /* KP 全表枚举解析（D 段可靠） */
 int se_insn_pc_related(se_u32 inst);              /* PC 相关指令判定（决策面/读门共用） */
@@ -464,6 +469,11 @@ int se_recalibrate_light(void);
 int se_recalibrate_full(void);
 void se_avc_flush_after_recal(void);
 void se_recalibrate(void);
+/* 旗排水重活 kthread 化：门/bprm 只清旗，recal/comp 重活由 worker 执行 */
+int se_recal_worker_start(void);
+void se_recal_worker_stop(void);
+int se_worker_pin(const char *tag, void *t);   /* kthread 绑大核（调度隔离） */
+extern int g_recal_worker_ready;
 extern int g_degraded;
 extern volatile int g_recal_busy;
 /* 决策面（avc_denied，RCU 读临界区，禁睡眠）只置旗，

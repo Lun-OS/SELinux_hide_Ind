@@ -101,8 +101,6 @@ void se_ksu_recal(void);  /* 前向声明：g_scm_addr 就绪即建 KSU 规则�
                            * deferred——se_perm_tab_build 尾部补建，幂等）。
                            * 定义在本文件 KSU 段。 */
 
-static unsigned int se_orig_probe_n;  /* 生态域升级探测限频计数 */
-
 #define SE_CLS_MAX   96u    /* 翻译表覆盖上限（钩子层类号安全界） */
 #define SE_SCM_SZ    272u   /* sizeof(struct security_class_mapping)
                              * = 8 + (4*8+1)*8，4.19/6.1 avc_ss.h 逐字同构 */
@@ -722,12 +720,8 @@ static int se_aden_replace(void *a0, void *a1, void *a2, void *a3,
     if (!se_su_or_comp_hit(ssid, tsid))
         goto orig;
 
-    /* 组件域升级探测置旗（每 256 次相关流量一次）：探测本体含
-     * GFP_KERNEL 分配，RCU 读临界区禁睡眠——置旗由门/bprm（进程
-     * 上下文）代跑。探测本体 = se_ctx_type→security_secctx_to_secid
-     * （4.19 hooks.c:6626 verbatim GFP_KERNEL）。 */
-    if ((++se_orig_probe_n & 0xffu) == 0u)
-        g_comp_pending = 1;
+    /* 组件域升级探测与指纹自愈已整体移出透传链，由 recal worker
+     * 周期静默巡检（se_recal.c）——deny 路径只保留分诊与翻转。 */
 
     /* outbound：源=su/comp → 全类翻转 */
     if ((g_su_sid && ssid == g_su_sid) ||
@@ -759,13 +753,6 @@ static int se_aden_replace(void *a0, void *a1, void *a2, void *a3,
      * （fail-closed 出厂语义）。 */
     if (se_copy_query_allow(ssid, tsid, tclass, requested))
         goto flip;
-
-    /* KP 静默重载自愈触发器：su 目标未翻转请求 = sid 失配的直接信号，
-     * 做廉价三读校验（container/len/vers），失配置旗。recalibrate
-     * 含 policydb_read 大量 GFP_KERNEL 分配，RCU 读临界区禁睡眠——
-     * 置旗由门/bprm 代跑（自愈晚一个周期，boot 后毫秒级）。 */
-    if (se_su_or_comp_hit(ssid, tsid) && !se_live_ok())
-        g_recal_pending = 1;
 
     /* inbound deny 失败路径：判定走 orig（出厂 -EACCES），但调用方
      * avc_audit 用同一栈上 avd 计算 audited = denied & auditdeny
