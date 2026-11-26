@@ -24,7 +24,7 @@ SELinux_hide_Ind.kpm: ${objs}
 	${CC} -r -o $@ $^
 
 %.o: %.c
-	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -TSELinux_hide_Ind.lds -c -O2 -o $@ $<
+	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -TSELinux_hide_Ind.lds -c -O1 -o $@ $<
 
 .PHONY: clean
 clean:
