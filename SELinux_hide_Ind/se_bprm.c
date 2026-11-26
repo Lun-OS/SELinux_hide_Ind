@@ -307,17 +307,50 @@ static void se_switch_to_su(void *bprm)
         pr_info("sehide: cred off=%u\n", g_cred_off);
     }
 
-    if (!se_bprm_is_adb_bin(bprm))
+    if (!se_bprm_is_adb_bin(bprm)) {
+        /* r17 诊断：uid0 exec 未盖章 = su 域切换丢失的直接原因观测。
+         * 打印该 exec 的首个路径串（与 is_adb_bin 同款扫描），限频
+         * 1/16，用于确定 su 流程最终 exec 的真实路径。 */
+        static int np_n;
+
+        if ((++np_n & 0x0fu) == 1u) {
+            se_u32 i;
+
+            for (i = g_cred_off + 8u; i + 8u <= g_cred_off + 72u;
+                 i += 8u) {
+                se_u64 s = 0;
+                char pbuf[32];
+
+                if (se_kread(&s, (se_u8 *)bprm + i, 8) || !se_kptr_ok(s))
+                    continue;
+                memset(pbuf, 0, sizeof(pbuf));
+                if (se_kread(pbuf, (void *)(se_ulong)s, sizeof(pbuf) - 1u))
+                    continue;
+                if (pbuf[0] != '/')
+                    continue;
+                pr_info("sehide: uid0 exec nostamp path=%s\n", pbuf);
+                break;
+            }
+        }
         return;
+    }
 
     if (se_kread(&cred, (se_u8 *)bprm + g_cred_off, 8) || !se_kptr_ok(cred))
         return;
 
     rc = ((int (*)(void *, se_u32))p_set_sec_override)
         ((void *)(se_ulong)cred, tgt);
-    /* 成功是预期行为，静默（生态组件 exec 频率高，逐条打印会冲刷日志）；
-     * 仅失败限频诊断。 */
-    if (rc) {
+    /* r17 诊断：成功 1/16 采样——组件域切换是否真的发生（"看似有 root
+     * 实则无法操作"的首要判别点：没有本打印 = 切换未触发）。 */
+    if (!rc) {
+        static int sok_n;
+
+        if ((++sok_n & 0x0fu) == 1u)
+            pr_info("sehide: component exec -> %s domain ok (n=%d)\n",
+                    g_comp_ctx, sok_n);
+        return;
+    }
+    {
         static int swf_n;
 
         if (swf_n < 4) {
@@ -484,15 +517,15 @@ int se_find_fn_field(se_u64 base, se_u64 target, se_u32 *off_out)
  * event 期原子安装。
  *
  * 只保留数据面路径：
- *   ≤6.11  security_hook_heads 数据槽（fp_hook，实测存活）；
+ *   ≤6.11  security_hook_heads 数据槽（fp_hook，验证存活）；
  *   6.12+  静态调用分发不经 security_hook_heads —— 原 __static_call_update
  *          路径是 text_poke 写指令（MKP 设备必死），整支删除；
  *          改用影子页改函数入口，对 static_call/直调全体调用方等效且
  *          不写任何内核指令。
  * KPM_EVENT 持 rcu_read_lock（module.c:691-704），本函数只做 fp_hook 数据槽
  * 写（hotpatch_nosync 原子序列，无 grace 等待）与影子页 stop_machine ——
- * 均不睡眠等待 grace，RCU 读段内无自死锁面（synchronize_rcu 卡死红线
- * 见 sehide_main.c）。 */
+ * 均不睡眠等待 grace，RCU 读段内无自死锁面（synchronize_rcu 在 RCU 读段内等待
+ * grace 会自死锁，见 sehide_main.c）。 */
 int se_install_hook_early(void)
 {
     void *bak = 0;

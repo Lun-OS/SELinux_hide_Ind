@@ -43,9 +43,68 @@ static se_u32 se_aden_saved[SE_ADEN_PATCH_N];
  *   se_aden_mode    1=direct 内核入口接管（主形态）2=coexist KP replace 叠挂（回退） */
 static unsigned long se_aden_target;
 static int se_aden_bak_n;
+/* r17 诊断：入口补丁快照（install 成功后复制），供 recal 巡检比对
+ * 入口是否仍被我们接管——被还原 = 决策面失明（su 无兜底全灭）。 */
+static se_u32 se_aden_live[SE_ADEN_PATCH_N];
+/* 第二接管点：security_secctx_to_secid（域翻译，仅特权路径——su
+ * setcon 链的翻译步骤；非特权不发起 setcon，不受影响）。生态注入域
+ * （magisk 等）不在 live sidtab，KP setcon 的 secctx→sid 查找失败 →
+ * 切域失败（6.1 上表现为 context=shell:s0）。别名规则：live 查找失败但副本有效
+ * 的上下文 → 返回 comp_sid（su:s0，live 有效 sid）→ 会话进入决策面
+ * 覆盖集。调用者仅 KP setcon + netfilter/netlabel 配置态（cred.c:796
+ * 唯一常态调用者），零热路径。live 命中 → 原样透传（出厂语义）。 */
+static unsigned long se_sec_target;
+static int se_sec_bak_n, se_sec_patched, se_sec_on;
+static se_u32 se_sec_saved[SE_ADEN_PATCH_N];
+static se_u32 se_sec_live[SE_ADEN_PATCH_N];
+static se_u32 se_sec_tramp[SE_ADEN_TRAMP_N]
+    __attribute__((section(".text"), aligned(4)));
+typedef int (*se_sec_fn)(const char *, se_u32, se_u32 *);
 static int se_aden_mode;
 /* coexist 回退形态下的 KP replace 地址（日志/诊断用）。 */
 static unsigned long se_kp_replace_addr;
+/* bypass 形态（KP unhook + direct）的回滚状态：
+ *   se_kp_avc_unhooked   我们对 avc_denied 调过 p_kp_unhook（卸载/失败
+ *                        路径必须 p_kp_hook 装回，否则 KP root 放行丢失）
+ *   se_kp_slow_unhooked  同上，slow_avc_audit
+ *   se_kp_slow_replace   slow_avc_audit 的 KP replace 地址（重装参数） */
+static int se_kp_avc_unhooked;
+static int se_kp_slow_unhooked;
+static unsigned long se_kp_slow_replace;
+static se_u32 se_rdiag_n;       /* 决策面透传打印限流计数 */
+
+/* KP hook 重装（p_kp_hook 语义与 boot 期一致：重读当前入口为
+ * origin_insts——调用前提：入口已恢复原始指令）。 */
+static void se_kp_rehook_avc(void)
+{
+    void *bak = 0;
+
+    if (!se_kp_avc_unhooked)
+        return;
+    se_kp_avc_unhooked = 0;
+    if (p_kp_hook && se_kp_replace_addr &&
+        !((int (*)(void *, void *, void **))p_kp_hook)
+            ((void *)(se_ulong)p_adenied, (void *)se_kp_replace_addr, &bak))
+        return;
+    /* 重装失败 = 入口保持原始态（stock 语义，无翻转无 KP 放行）。
+     * 系统稳定 fail-closed，仅功能缺失——概率极低（unhook 刚成功）。 */
+    pr_info("sehide: kp re-hook FAILED, entry left stock (su grant down)\n");
+}
+
+static void se_kp_rehook_slow(void)
+{
+    void *bak = 0;
+
+    if (!se_kp_slow_unhooked)
+        return;
+    se_kp_slow_unhooked = 0;
+    if (p_kp_hook && se_kp_slow_replace) {
+        ((int (*)(void *, void *, void **))p_kp_hook)
+            ((void *)(se_ulong)p_slow_audit, (void *)se_kp_slow_replace, &bak);
+        return;
+    }
+    pr_info("sehide: kp slow re-hook skipped (sym missing)\n");
+}
 
 /* backup trampoline 的调用原型：与 avc_denied 完全同签名（9 参），参数
  * 寄存器/栈透传。 */
@@ -111,6 +170,8 @@ static se_u32 g_perm_bit[SE_CLS_MAX][SE_PERM_MAX];  /* tclass → 位 i 的 poli
 static se_u32 g_nperm_tab[SE_CLS_MAX];              /* 每类钩子层权限数 */
 static int g_tab_ready;
 static unsigned long g_scm_addr;                     /* 自证通过的 secclass_map 地址 */
+static se_u32 g_ksvc_cls;                            /* kernel_service 钩子层类号
+                                                      * （setcon 翻转判据，安装期解析） */
 
 int se_perm_tab_ready(void)
 {
@@ -615,8 +676,47 @@ static se_u32 se_ksu_sid_of(const char *ctx)
  * install 均调用）。幂等。 */
 void se_ksu_recal(void)
 {
+    if (!g_scm_addr) {
+        /* r15 修复：决策面 selftest（init→su binder 必 deny 出厂前提）
+         * 依赖 G4 init 全类规则翻转；scm/规则表 deferred 时 selftest
+         * 必返 -13 → 决策面永久降级。scm 解析仅依赖内核
+         * 符号，与副本无关——提前到决策面安装前执行。 */
+        if (se_scm_resolve())
+            return;
+    }
     if (!g_ksu_tab_ready)
         se_ksu_tab_build();
+
+    /* kernel_service 类号解析（幂等，一次）：SECCLASS_* 常量 = secclass_map
+     * 顺序（钩子层号），扫内核静态表按名定位，与 policy 重载无关。
+     * 用途：setcon 翻转判据——KP set_security_override_from_ctx →
+     * security_kernel_act_as 的 avc_has_perm(当前域→su, kernel_service,
+     * use_as_override) 不放行则 selinux_kernel_act_as 不写 sid（hooks.c
+     * 源码），setcon 静默失败进程留原域。 */
+    if (!g_ksvc_cls && g_scm_addr) {
+        se_u32 t;
+
+        for (t = 1; t < SE_CLS_MAX; t++) {
+            se_u64 name_ptr = 0;
+            char name[24];
+
+            if (se_kread(&name_ptr, (void *)(g_scm_addr +
+                         (unsigned long)(t - 1u) * SE_SCM_SZ), 8))
+                break;                          /* 表尾 */
+            if (!se_kptr_ok(name_ptr))
+                break;
+            memset(name, 0, sizeof(name));
+            if (se_kread(name, (void *)name_ptr, sizeof(name) - 1u))
+                break;
+            if (!strncmp(name, "kernel_service", sizeof(name))) {
+                g_ksvc_cls = t;
+                pr_info("sehide: kernel_service class=%u\n", t);
+                break;
+            }
+        }
+        if (!g_ksvc_cls)
+            pr_info("sehide: kernel_service class not found\n");
+    }
 
     g_ksu_sid_init = se_ksu_sid_of("u:r:init:s0");
     g_ksu_sid_sm   = se_ksu_sid_of("u:r:servicemanager:s0");
@@ -714,19 +814,47 @@ static int se_aden_replace(void *a0, void *a1, void *a2, void *a3,
     tclass    = (se_u32)(se_u64)v[off + 2u] & 0xffffu;
     requested = (se_u32)(se_u64)v[off + 3u];
 
+    /* 诊断打印（只读，限流，特权/非特权请求均经过此处）：1/65536 采样。
+     * 风暴期 denial 每秒千级，
+     * 1/1024 在 denial 风暴期仍会刷屏，1/65536 ≈ 分钟级 1 条。 */
+    if ((++se_rdiag_n & 0xffffu) == 1u)
+        pr_info("sehide: rp-pt s=%u t=%u c=%u r=%x tr=%08x %08x\n",
+                ssid, tsid, tclass, requested, se_aden_tramp[0],
+                se_aden_tramp[1]);
+
     /* 非特权（非 su/comp sid 相关）请求仅此一次分诊判决即透传内核
      * 原版——不查副本、不参与探测计数，放行与否完全由内核判决
-     * （时序面 = 一次整数比较）。生态规则收口查询保留在 su/comp 路径。 */
+     * （时序面 = 2 次整数比较）。判定集唯一：域基准（ssid/tsid）。
+     * uid0 不参与判定：setcon 链闭环（secctx 别名 +
+     * kernel_service 翻转）后 su 进程必然进 su 域，由 outbound 翻转
+     * 覆盖——uid0 属超宽判据（非授权 uid0 daemon 也放行），不符合
+     * 决策层"域基准 + 单一透传/翻转"设计。
+     *
+     * 已知缺口（仅特权路径，非特权路径不受影响）：KP 的 trusted-manager
+     * per-task 旗标（task_ext->priv_sel_allow，管理器进程 uid10320/
+     * untrusted_app 域）在本层无等效兑现——管理器进程本体的 SELinux
+     * 拒绝（如 patch state 的 symlink）透传出厂 EACCES。不影响
+     * supercall 路径（不涉 SELinux）与 apd 路径（exec 钩子切 su 域），
+     * 仅管理器进程直接文件操作受限。若需修复：denial 时查 KP
+     * get_current_task_ext 的旗标并按 pid 缓存（首次 O(1024)，
+     * 缓存命中 ns 级）——未实现，避免热路径回归。 */
     if (!se_su_or_comp_hit(ssid, tsid))
         goto orig;
+
+    /* setcon 到 su 域授权检查翻转（位于 su/comp 命中分支内：非特权路径
+     * 仅前面 2 次整数比较即透传，本判据零触及）。secclass_map 钩子层
+     * 类号安装期解析（g_ksvc_cls），运行时 = 2 次整数比较。 */
+    if (g_ksvc_cls && tclass == g_ksvc_cls && tsid == g_su_sid)
+        goto flip;
 
     /* 组件域升级探测与指纹自愈已整体移出透传链，由 recal worker
      * 周期静默巡检（se_recal.c）——deny 路径只保留分诊与翻转。 */
 
     /* outbound：源=su/comp → 全类翻转 */
     if ((g_su_sid && ssid == g_su_sid) ||
-        (g_comp_sid && ssid == g_comp_sid))
+        (g_comp_sid && ssid == g_comp_sid)) {
         goto flip;
+    }
 
     /* inbound —— KSU 原版规则集 (类,perm,源域) 匹配。
      * 全类组（init 源 / binder ALL）→ 全置 flip；位组 → 仅放行规则
@@ -735,8 +863,9 @@ static int se_aden_replace(void *a0, void *a1, void *a2, void *a3,
     {
         se_u32 kmask = se_ksu_rule_mask(ssid, tclass);
 
-        if (kmask == 0xffffffffu)
+        if (kmask == 0xffffffffu) {
             goto flip;
+        }
         if (kmask & requested) {
             if (avd) {
                 f = (se_u32 *)avd;
@@ -751,8 +880,9 @@ static int se_aden_replace(void *a0, void *a1, void *a2, void *a3,
      * 基底 + 生态规则 + 引擎盖章；出厂 allow 的请求不会进 denied 收口，
      * 故查询命中 ⟺ 生态规则新增授权）。查询未就绪/未命中 → orig
      * （fail-closed 出厂语义）。 */
-    if (se_copy_query_allow(ssid, tsid, tclass, requested))
+    if (se_copy_query_allow(ssid, tsid, tclass, requested)) {
         goto flip;
+    }
 
     /* inbound deny 失败路径：判定走 orig（出厂 -EACCES），但调用方
      * avc_audit 用同一栈上 avd 计算 audited = denied & auditdeny
@@ -766,6 +896,11 @@ static int se_aden_replace(void *a0, void *a1, void *a2, void *a3,
     goto orig_audit_suppress;
 
 flip:
+    /* r17 诊断：outbound 翻转 1/128 采样（1/65536 太稀，outbound 才是
+     * su 存活判据；inbound G4 翻转仅 selftest/生态触发，采样并入）。 */
+    if ((++se_rdiag_n & 0x7fu) == 1u)
+        pr_info("sehide: rp-flip s=%u t=%u c=%u r=%x avd=%016lx\n",
+                ssid, tsid, tclass, requested, (se_u64)(se_ulong)avd);
     if (avd) {
         f = (se_u32 *)avd;
         f[SE_AVD_OFF_ALLOWED / 4]    = 0xffffffffu;
@@ -781,7 +916,9 @@ orig_audit_suppress:
     }
     /* fallthrough */
 orig:
-    /* 原样透传全部 9 个槽：8 参形状下第 9 个是无关值，原函数忽略。 */
+    /* 原样透传全部 9 个槽：8 参形状下第 9 个是无关值，原函数忽略。
+     * 透传路径零打印零计数——热路径（denial 可达每秒千级）
+     * 任何打印都会灌满 dmesg 环形缓冲。 */
     return ((se_aden_orig_t)(se_u64)se_aden_tramp)
            (a0, a1, a2, a3, a4, a5, a6, a7, a8);
 }
@@ -797,23 +934,347 @@ void se_decision_recalibrate(void)
     pr_info("sehide: ksu rule refreshed (tab=%d)\n", g_ksu_tab_ready);
 }
 
+/* 第二接管点的 replace：live 命中原样透传；live 失败但副本有效的
+ * 上下文（生态注入域）→ 别名 comp_sid。限频打印。 */
+static int se_secctx_replace(const char *secctx, se_u32 seclen, se_u32 *secid)
+{
+    int rc = ((se_sec_fn)(se_u64)se_sec_tramp)(secctx, seclen, secid);
+
+    if (!rc || !secid)
+        return rc;
+    {
+        char buf[96];
+        se_u8 ctx[SE_CTX_BUF];
+        se_u32 n = seclen;
+        static int sn, sfn;
+        int prc;
+
+        if (!L.ok || !L.copy || n == 0 || n >= sizeof(buf) || !g_comp_sid) {
+            if (sfn < 16u) {        /* secctx 低频（仅 setcon/配置态）：
+                                     * 每次失败都打，总量封顶防异常风暴 */
+                sfn++;
+                pr_info("sehide: secctx gate fail rc=%d n=%u ok=%d copy=%d "
+                        "comp=%u\n", rc, n, L.ok, !!L.copy, g_comp_sid);
+            }
+            return rc;
+        }
+        memcpy(buf, secctx, n);
+        buf[n] = 0;
+        memset(ctx, 0, sizeof(ctx));
+        /* 形态校验门（不依赖副本/注入时序）：3-5 段冒号分隔、user/role/
+         * type 非空 = 合法 SELinux 上下文。已观测到：用户态注入未
+         * 跑（无 /load absorbed）时副本 symtab 无注入类型（seg_val -2），
+         * 按"副本必须含此类型"设门会让别名依赖注入是否发生——错误。
+         * live 查找已失败（进到此处的前提）+ 形态合法 → 直接别名 su 域：
+         * setcon 目的只是把进程送进被覆盖域，su:s0 是 live 有效 sid，
+         * 出厂 magisk 类型存在与否无关紧要。副本 parse 可用时仍先走
+         * （更严：拒绝副本也不认的上下文）。 */
+        {
+            unsigned int ci, seg = 1, seg_ok = 1, len = 0;
+
+            for (ci = 0; ci < n; ci++) {
+                if (buf[ci] == ':') {
+                    if (!len)
+                        seg_ok = 0;     /* 空段 */
+                    seg++;
+                    len = 0;
+                } else {
+                    len++;
+                }
+            }
+            if (!len || seg < 3u || seg > 5u)
+                seg_ok = 0;
+            if (!seg_ok) {
+                if (sfn < 16u) {
+                    sfn++;
+                    pr_info("sehide: secctx shape fail n=%u seg=%u "
+                            "ctx='%.16s'\n", n, seg, buf);
+                }
+                return rc;              /* 非法形态：出厂失败语义 */
+            }
+        }
+        prc = se_parse_ctx(buf, ctx);
+        if (prc && prc != -2) {
+            if (sfn < 16u) {
+                unsigned int hi;
+
+                sfn++;
+                pr_info("sehide: secctx parse fail rc=%d n=%u ctx='%.16s' "
+                        "hex=", prc, n, buf);
+                for (hi = 0; hi < 16u && hi < n; hi++)
+                    pr_cont("%02x", buf[hi]);
+                pr_cont("\n");
+            }
+            return rc;              /* 结构异常：出厂失败语义 */
+        }
+        /* prc==-2 = 副本 symtab 无此类型（注入未跑/未吸收）：形态已合法，
+         * 照常别名（不再依赖副本内容）。 */
+        *secid = g_comp_sid;
+        if ((++sn & 0x0fu) == 1u)
+            pr_info("sehide: secctx alias '%s' -> su sid=%u (n=%d)\n",
+                    buf, g_comp_sid, sn);
+        return 0;
+    }
+}
+
+/* 第二接管点安装（avc 接管成功后调用）。独立失败仅告警——决策面
+ * 主功能不依赖本点，6.1 的 su 切域依赖它。 */
+static int se_sec_install(void)
+{
+    se_u32 e[5] = {0, 0, 0, 0, 0};
+    se_u32 insns[SE_ADEN_PATCH_N];
+    unsigned long lo;
+    int i, rc, pad_bti = 0;
+
+    if (se_sec_on || !p_secctx_to_sid || !p_kp_hpnosync)
+        return -1;
+    se_sec_target = (unsigned long)p_secctx_to_sid;
+
+    for (i = 0; i < 5; i++) {
+        if (se_kread(&e[i], (void *)(se_sec_target +
+                     (unsigned long)i * 4u), 4))
+            return -2;
+    }
+    switch (e[0]) {
+    case 0xd503233fu: case 0xd503237fu:
+    case 0xd503245fu: case 0xd503249fu:
+    case 0xd50324dfu:
+        pad_bti = 1;
+        break;
+    default:
+        if ((e[0] >> 24u) == 0xa9u || (e[0] >> 24u) == 0xa8u ||
+            (e[0] >> 24u) == 0xd1u || e[0] == 0xd503201fu)
+            pad_bti = 0;
+        else {
+            pr_info("sehide: secctx entry %08x not a prologue, skip\n", e[0]);
+            return -3;
+        }
+    }
+    se_sec_bak_n = pad_bti ? 5u : 4u;
+    for (i = 0; i < (int)se_sec_bak_n; i++) {
+        if (se_kread(&se_sec_saved[i], (void *)(se_sec_target +
+                     (unsigned long)i * 4u), 4))
+            return -4;
+        if (se_insn_pc_related(se_sec_saved[i])) {
+            pr_info("sehide: secctx inst[%d] %08x pc-relative, skip\n",
+                    i, se_sec_saved[i]);
+            return -5;
+        }
+    }
+    lo = (unsigned long)se_secctx_replace;
+    if (pad_bti) {
+        insns[0] = 0xd50324dfu;
+        insns[1] = 0x58000051u;
+        insns[2] = 0xd61f0220u;
+        insns[3] = (se_u32)(lo & 0xFFFFFFFFu);
+        insns[4] = (se_u32)(lo >> 32u);
+    } else {
+        insns[0] = 0x58000051u;
+        insns[1] = 0xd61f0220u;
+        insns[2] = (se_u32)(lo & 0xFFFFFFFFu);
+        insns[3] = (se_u32)(lo >> 32u);
+    }
+    /* trampoline：前缀副本 + 跳回（单词写已验证路径）。 */
+    {
+        int (*wn)(void *, unsigned int) =
+            (int (*)(void *, unsigned int))(se_ulong)p_kp_hpnosync;
+        unsigned long back = se_sec_target +
+            (unsigned long)se_sec_bak_n * 4u;
+        int tn = (int)se_sec_bak_n + 4;
+
+        for (i = 0; i < (int)se_sec_bak_n; i++)
+            se_sec_tramp[i] = se_sec_saved[i];
+        se_sec_tramp[se_sec_bak_n]     = 0x58000051u;
+        se_sec_tramp[se_sec_bak_n + 1] = 0xd61f0220u;
+        se_sec_tramp[se_sec_bak_n + 2] = (se_u32)(back & 0xFFFFFFFFu);
+        se_sec_tramp[se_sec_bak_n + 3] = (se_u32)(back >> 32u);
+        for (i = 0; i < tn; i++) {
+            volatile se_u32 *rv = (volatile se_u32 *)
+                (unsigned long)((unsigned long)se_sec_tramp +
+                                (unsigned long)i * 4u);
+
+            rc = wn((void *)(unsigned long)
+                    ((unsigned long)se_sec_tramp +
+                     (unsigned long)i * 4u), se_sec_tramp[i]);
+            if (rc || *rv != se_sec_tramp[i]) {
+                pr_info("sehide: secctx tramp w%d FAIL\n", i);
+                return -6;
+            }
+        }
+        /* 入口补丁（单词写 + volatile 逐词验证）。 */
+        for (i = 0; i < (int)se_sec_bak_n; i++) {
+            volatile se_u32 *rv = (volatile se_u32 *)
+                (unsigned long)(se_sec_target +
+                                (unsigned long)i * 4u);
+
+            rc = wn((void *)(unsigned long)(se_sec_target +
+                    (unsigned long)i * 4u), insns[i]);
+            if (rc || *rv != insns[i]) {
+                pr_info("sehide: secctx entry w%d FAIL\n", i);
+                for (; i >= 0; i--)
+                    wn((void *)(unsigned long)(se_sec_target +
+                       (unsigned long)i * 4u), se_sec_saved[i]);
+                return -7;
+            }
+        }
+        se_sec_patched = 1;
+        for (i = 0; i < (int)se_sec_bak_n; i++)
+            se_sec_live[i] = insns[i];
+        if (p_msleep_interruptible)
+            ((void (*)(se_ulong))p_msleep_interruptible)(10);
+        for (i = 0; i < (int)se_sec_bak_n; i++) {
+            volatile se_u32 *rv = (volatile se_u32 *)
+                (unsigned long)(se_sec_target +
+                                (unsigned long)i * 4u);
+
+            if (*rv != insns[i]) {
+                pr_info("sehide: secctx verify FAIL @%d\n", i);
+                for (i = (int)se_sec_bak_n - 1; i >= 0; i--)
+                    wn((void *)(unsigned long)(se_sec_target +
+                       (unsigned long)i * 4u), se_sec_saved[i]);
+                se_sec_patched = 0;
+                return -8;
+            }
+        }
+        se_sec_on = 1;
+        pr_info("sehide: secctx takeover on %016lx (prologue %08x bak=%d)\n",
+                se_sec_target, se_sec_saved[0], se_sec_bak_n);
+        return 0;
+    }
+}
+
+static void se_sec_restore(void)
+{
+    int i;
+
+    if (!se_sec_patched || !se_sec_target || !p_kp_hpnosync)
+        return;
+    {
+        int (*wn)(void *, unsigned int) =
+            (int (*)(void *, unsigned int))(se_ulong)p_kp_hpnosync;
+
+        for (i = 0; i < se_sec_bak_n; i++)
+            wn((void *)(se_sec_target + (unsigned long)i * 4u),
+               se_sec_saved[i]);
+    }
+    se_sec_patched = 0;
+    se_sec_on = 0;
+    pr_info("sehide: secctx takeover restored\n");
+}
+
+/* 入口巡检（recal worker 周期调用）：读 avc_denied 入口逐词比对快照。
+ * 被还原/被改 → 单词写重新接管（install 同款已验证路径）并复验；
+ * 复验仍失败 → 返回负值由调用方降级决策。返回 0=在岗/已自愈。
+ * 修复打印限频由调用方控制，此处每次实况只打一条。 */
+int se_decision_entry_check(void)
+{
+    se_u32 cur[SE_ADEN_PATCH_N];
+    int i, bad = 0, rc, sw = 0;
+
+    if (!se_decision_on || !se_aden_patched || !se_aden_target)
+        return 0;
+    for (i = 0; i < se_aden_bak_n; i++)
+        cur[i] = 0;
+    if (se_kread(cur, (void *)(se_aden_target),
+                 (unsigned long)se_aden_bak_n * 4u))
+        return -1;
+    for (i = 0; i < se_aden_bak_n; i++)
+        if (cur[i] != se_aden_live[i])
+            bad = 1;
+    /* 第二接管点在岗校验 + 自愈（同款单词写路径）。与 avc 巡检独立：
+     * avc 在岗时也必须检查 secctx 接管点。 */
+    if (se_sec_on && se_sec_patched && se_sec_target) {
+        se_u32 sc[SE_ADEN_PATCH_N];
+        int sbad = 0, sw = 0;
+
+        for (i = 0; i < se_sec_bak_n; i++)
+            sc[i] = 0;
+        if (!se_kread(sc, (void *)(se_sec_target),
+                      (unsigned long)se_sec_bak_n * 4u)) {
+            for (i = 0; i < se_sec_bak_n; i++)
+                if (sc[i] != se_sec_live[i])
+                    sbad = 1;
+            if (sbad && p_kp_hpnosync) {
+                int (*wn)(void *, unsigned int) =
+                    (int (*)(void *, unsigned int))(se_ulong)p_kp_hpnosync;
+
+                for (i = 0; i < se_sec_bak_n; i++)
+                    wn((void *)(se_sec_target +
+                                (unsigned long)i * 4u), se_sec_live[i]);
+                for (i = 0; i < se_sec_bak_n; i++) {
+                    volatile se_u32 *rv = (volatile se_u32 *)
+                        (unsigned long)(se_sec_target +
+                                        (unsigned long)i * 4u);
+
+                    if (*rv != se_sec_live[i])
+                        sbad = 2;
+                }
+                sw = 1;
+            }
+            pr_info("sehide: secctx entry %s (n=%d)\n",
+                    sbad == 0 ? "ok" : (sbad == 2 ? "heal FAIL" : "healed"),
+                    se_sec_bak_n);
+        }
+    }
+    if (!bad)
+        return sw ? 1 : 0;
+    pr_info("sehide: entry drift %08x %08x %08x %08x %08x (n=%d), re-take\n",
+            cur[0], cur[1], cur[2], cur[3], cur[4], se_aden_bak_n);
+    if (!p_kp_hpnosync)
+        return -2;
+    {
+        int (*wn)(void *, unsigned int) =
+            (int (*)(void *, unsigned int))(se_ulong)p_kp_hpnosync;
+
+        for (i = 0; i < se_aden_bak_n; i++) {
+            rc = wn((void *)(se_aden_target +
+                             (unsigned long)i * 4u), se_aden_live[i]);
+            if (rc)
+                return -3;
+        }
+    }
+    for (i = 0; i < se_aden_bak_n; i++)
+        cur[i] = 0;
+    if (se_kread(cur, (void *)(se_aden_target),
+                 (unsigned long)se_aden_bak_n * 4u))
+        return -4;
+    for (i = 0; i < se_aden_bak_n; i++)
+        if (cur[i] != se_aden_live[i])
+            return -5;
+    pr_info("sehide: entry re-take ok (n=%d)\n", se_aden_bak_n);
+    return 1;
+}
+
 /* 入口恢复：把备份的落点前缀写回（模块卸载 / 自检失败回退共用）。
  * direct 模式：avc_denied 复原为原始函数（KP 已 unhook，记录已释放，
  * 系统回到"无任何 SELinux hook"态）；coexist 模式：KP replace 入口
  * 复原，KP 自身 hook/backup 链原样。 */
 static void se_aden_restore(void)
 {
-    void *addrs[SE_ADEN_PATCH_N];
     int i;
 
-    if (!se_aden_patched || !p_patch_text || !se_aden_target)
+    if (!se_aden_patched || !se_aden_target)
         return;
 
-    for (i = 0; i < se_aden_bak_n; i++)
-        addrs[i] = (void *)(se_aden_target + (unsigned long)i * 4u);
+    /* 恢复写路径：多词写（fixmap/alias 两原语）曾在历史会话只正确落
+     * 前半（后 2 词丢/坏），恢复用多词 = 恢复出错位态（ueventd 在
+     * restore 窗口执行半成品入口崩）。单词 nosync 逐词写 + 跨核
+     * 视图风险窗口 µs 级，为当前最可靠恢复手段。 */
+    if (p_kp_hpnosync) {
+        int (*wn)(void *, unsigned int) =
+            (int (*)(void *, unsigned int))(se_ulong)p_kp_hpnosync;
 
-    ((int (*)(void **, se_u32 *, int))p_patch_text)
-        (addrs, se_aden_saved, se_aden_bak_n);
+        for (i = 0; i < se_aden_bak_n; i++)
+            wn((void *)(se_aden_target + (unsigned long)i * 4u),
+               se_aden_saved[i]);
+    } else if (p_patch_text) {
+        void *addrs[SE_ADEN_PATCH_N];
+
+        for (i = 0; i < se_aden_bak_n; i++)
+            addrs[i] = (void *)(se_aden_target + (unsigned long)i * 4u);
+        ((int (*)(void **, se_u32 *, int))p_patch_text)
+            (addrs, se_aden_saved, se_aden_bak_n);
+    }
     se_aden_patched = 0;
 }
 
@@ -826,24 +1287,93 @@ void se_decision_uninstall(void)
     se_decision_on = 0;
     pr_info("sehide: decision-plane uninstalled, entry restored (mode=%s)\n",
             se_aden_mode == 1 ? "direct" : "coexist");
+    /* bypass 形态下 KP 的 hook 已被我们 unhook——装回 KP（恢复 root
+     * 放行与审计静音），系统完整回到 KP 原态。 */
+    se_kp_rehook_avc();
+    se_kp_rehook_slow();
+    se_sec_restore();
 }
 
+/* S4 鉴别实验：patch 参数数组从栈改全局——栈版本在 unhook 后两写
+ * 原语（内核 fixmap / KP alias-PTE）落盘同模式 stride-2 错位，写
+ * 原语已排除；栈数组是与两条原语共享的剩余环节。若全局版落盘
+ * 正确 → 错位源 = 栈内容在 patch 调用窗口被改写；若仍错位 → 排除
+ * 栈，指向更深层。 */
+static void *se_aden_addrs[SE_ADEN_PATCH_N];
+static se_u32 se_aden_insns[SE_ADEN_PATCH_N];
+static void *se_tramp_addrs[SE_ADEN_TRAMP_N];
+static se_u32 se_tramp_insns[SE_ADEN_TRAMP_N];
+static int se_tramp_word_ok;   /* tramp 单词写全词验证通过 → entry 同法 */
+/* r12：KPM data/bss 区 store→load 不可靠实锤（memtest：写入值偏移
+ * 2 词、原位置出现跨 boot 恒定的外来值）——参数数组全部迁往内核
+ * vmalloc（rp 门同款分配），写入后自测，绕开 KPM 映射层。 */
+static void *se_va_buf;
+static unsigned long se_va_saved;
+
+/* 模块卸载：恢复落点入口原始前缀，决策面下线。由 sehide_exit 调用。 */
 int se_decision_install(void)
 {
-    void *addrs[SE_ADEN_PATCH_N];
-    se_u32 insns[SE_ADEN_PATCH_N];
+    void **addrs;
+    se_u32 *insns;
     unsigned long back, target, lo;
     se_u32 init_sid = 0, binder_cls = 0;
     int i, rc, pad_bti = 0;
 
     if (se_decision_on)
         return 0;
+
+    /* r12：参数数组 vmalloc 化。布局：addrs(48B=6 槽)|insns@48(24B)|
+     * taddrs@96(48B)|tinsns@144(48B)|sig@192 = 288B → 512B。
+     * r15 修复：原 addrs 仅 32B（4 槽），BTI pad bak_n=5 时第 5 个
+     * 64 位指针溢出 8B 覆盖 insns[0..1]（BTI JC/LDR X17 被替换为
+     * addrs[4]=target+0x10 的 quad）→ 入口首词执行非法指令 panic
+     *（6.1 PACIASP 序言形态下）。insns 起点移至 +48 与 addrs 5 槽隔离。 */
+    if (!p_vmalloc_user || !p_vfree) {
+        pr_info("sehide: vmalloc syms missing\n");
+        ((void (*)(void *))p_vfree)(se_va_buf);
+        se_va_buf = 0;
+        return -1;
+    }
+    se_va_buf = ((void *(*)(se_u64))p_vmalloc_user)(512u);
+    if (!se_va_buf) {
+        pr_info("sehide: vmalloc(256) fail\n");
+        ((void (*)(void *))p_vfree)(se_va_buf);
+        se_va_buf = 0;
+        return -1;
+    }
+    {
+        volatile se_u32 *t = (volatile se_u32 *)se_va_buf;
+        int ok = 1;
+
+        for (i = 0; i < 8; i++)
+            t[i] = 0xA0000000u + (se_u32)i;
+        for (i = 0; i < 8; i++)
+            if (t[i] != 0xA0000000u + (se_u32)i)
+                ok = 0;
+        pr_info("sehide: va selftest ok=%d r=%08x %08x %08x %08x\n",
+                ok, t[0], t[1], t[2], t[3]);
+        if (!ok) {
+            ((void (*)(void *))p_vfree)(se_va_buf);
+            se_va_buf = 0;
+            se_kp_rehook_avc();
+            ((void (*)(void *))p_vfree)(se_va_buf);
+            se_va_buf = 0;
+            return -1;
+        }
+    }
+    addrs = se_va_buf;
+    insns = (se_u32 *)((unsigned long)se_va_buf + 48u);
+
     if (!p_adenied || !p_patch_text || !p_ahp || !g_su_sid) {
         pr_info("sehide: decision syms missing adenied=%016lx l3=%016lx "
                 "ptext=%016lx ahp=%016lx su=%u\n",
                 (se_u64)(se_ulong)p_adenied, (se_u64)(se_ulong)p_adenied_l3,
                 (se_u64)(se_ulong)p_patch_text, (se_u64)(se_ulong)p_ahp,
                 g_su_sid);
+        ((void (*)(void *))p_vfree)(se_va_buf);
+        se_va_buf = 0;
+        ((void (*)(void *))p_vfree)(se_va_buf);
+        se_va_buf = 0;
         return -1;
     }
 
@@ -852,51 +1382,122 @@ int se_decision_install(void)
 
         if (se_kread(&e[0], (void *)(se_ulong)p_adenied, 4) ||
             se_kread(&e[1], (void *)(se_ulong)(p_adenied + 4), 4) ||
-            se_kread(&e[2], (void *)(se_ulong)(p_adenied + 8), 4))
+            se_kread(&e[2], (void *)(se_ulong)(p_adenied + 8), 4)) {
+            ((void (*)(void *))p_vfree)(se_va_buf);
+            se_va_buf = 0;
             return -1;
+        }
 
         if ((e[0] == 0xd50324dfu && e[1] == 0x58000051u) ||
             (e[0] == 0x58000051u && e[1] == 0xd61f0220u)) {
             /* 态① KP pad 在岗 → avc_denied 直挂 + KP replace 保留为链上
              * 下一跳：备份 KP pad（仅卸载恢复用，不再被执行）；补丁写
-             * avc_denied（内核 text = 实测稳定写入面）；trampoline 纯
+             * avc_denied（内核 text 是稳定写入面）；trampoline 纯
              * 重定向——不复制、不跳过任何指令，kp_replace 从其真实入口
              * 原样执行（KP task_ext 按任务授予完整保留）。
-             * 红线：kpimg 零写入（patch_map 对 KP 分配 VA 地址翻译
-             * 不可靠，详见函数头注释）。 */
+             * 约束：kpimg 只读——patch_map 对 KP 分配 VA 的地址翻译
+             * 不可靠，详见函数头注释。 */
             se_u32 q0 = 0, q1 = 0;
 
             if (e[0] == 0xd50324dfu && e[2] != 0xd61f0220u) {
                 pr_info("sehide: adenied bti entry word2 %08x != BR X17\n",
                         e[2]);
+                ((void (*)(void *))p_vfree)(se_va_buf);
+                se_va_buf = 0;
                 return -2;
             }
             if (se_kread(&q0, (void *)(se_ulong)(p_adenied + 12), 4) ||
-                se_kread(&q1, (void *)(se_ulong)(p_adenied + 16), 4))
+                se_kread(&q1, (void *)(se_ulong)(p_adenied + 16), 4)) {
+                ((void (*)(void *))p_vfree)(se_va_buf);
+                se_va_buf = 0;
                 return -1;
+            }
             target = (e[0] == 0xd50324dfu)
                      ? ((unsigned long)q0 | ((unsigned long)q1 << 32u))
                      : ((unsigned long)e[2] | ((unsigned long)q0 << 32u));
             if ((target >> 48u) != 0xffffu) {
                 pr_info("sehide: kp replace target %016lx not kernel-text form\n",
                         target);
+                ((void (*)(void *))p_vfree)(se_va_buf);
+                se_va_buf = 0;
                 return -3;
             }
             se_kp_replace_addr = target;
             se_aden_target = p_adenied;
-            /* 补丁条数跟随 KP 的实际形态，不再写死 5。
-             * 约束：KP relo 返回点 = avc_denied + KP 补丁词数×4，我们的
-             * 补丁覆盖区必须恰好等于 KP 补丁区，多写一词就砸掉返回点
-             * （多写的那词会被当指令执行 → el1_undef）：
-             *   A（落点带 BTI）：KP 写 5 词，relo 返回 +0x14，我们写 5 词；
-             *   B（无 BTI，clang 内核无 PAC/BTI 序言）：KP 写 4 词，
-             *     relo 返回 +0x10，我们写 4 词。 */
-            se_aden_bak_n = (e[0] == 0xd50324dfu) ? 5 : 4;
-            se_aden_mode = 3;
-            pad_bti = (e[0] == 0xd50324dfu);
-            pr_info("sehide: coexist mount on avc_denied (kp replace via "
-                    "trampoline) %016lx, kp pad backed up, kpform=%s\n",
-                    target, e[0] == 0xd50324dfu ? "A-bti5" : "B-nobti4");
+            /* bypass 尝试：p_kp_unhook 让 KP 交还原始前缀（权威来源 =
+             * KP boot 期 origin_insts 备份，stop_machine 原子写回），
+             * 重读入口走 direct 组装（前缀副本 + 跳回 = 内核原生时序，
+             * 拒绝路径不再经过 kp_replace 的 O(1024) task_ext 扫表）。
+             * unhook 幂等（hook_t 缺失即 no-op，hmem.c:67-77）。
+             * 失败链：重读失败/序言异常 → p_kp_hook 装回 → coexist。
+             * 装回前提满足：KP 重装重读"当前入口"作 origin_insts，
+             * 此刻入口 = unhook 写回的原始指令，与 boot 期语义一致。 */
+            {
+                se_u32 f[5];
+                int bypassed = 0;
+
+                if (p_kp_unhook) {
+                    ((void (*)(void *))p_kp_unhook)((void *)(se_ulong)p_adenied);
+                    /* KP hook_t 已被 unhook 释放（成功与否）——无论 bypass
+                     * 结果如何置位，供失败/卸载路径的 re-hook 语义。 */
+                    se_kp_avc_unhooked = 1;
+                    for (i = 0; i < 5; i++) {
+                        if (se_kread(&f[i], (void *)(se_ulong)(p_adenied +
+                                     (unsigned long)i * 4u), 4))
+                            break;
+                    }
+                    if (i == 5) {
+                        switch (f[0]) {
+                        case 0xd503233fu: /* PACIASP */
+                        case 0xd503237fu: /* PACIBSP */
+                        case 0xd503245fu: /* BTI C */
+                        case 0xd503249fu: /* BTI J */
+                        case 0xd50324dfu: /* BTI JC */
+                            pad_bti = 1;
+                            bypassed = 1;
+                            break;
+                        default:
+                            if ((f[0] >> 24u) == 0xa9u || (f[0] >> 24u) == 0xa8u ||
+                                f[0] == 0xd503201fu) {
+                                pad_bti = 0;
+                                bypassed = 1;
+                            }
+                            break;
+                        }
+                    }
+                    if (bypassed) {
+                        se_aden_bak_n = pad_bti ? 5 : 4;
+                        se_aden_mode = 1;
+                        se_kp_avc_unhooked = 1;
+                        pr_info("sehide: kp unhooked, direct takeover "
+                                "(prologue %08x bak=%d)\n", f[0], se_aden_bak_n);
+                    } else {
+                        /* 白名单拒：绝不 p_kp_hook 重装——重装会把 KP pad
+                         * 内容备份成 origin_insts，破坏 KP relo 链（backup
+                         * 变 pad 副本 → BR krep → kp_replace 死循环 → PC
+                         * 乱飞 el1 崩溃）。直接 coexist：
+                         *   unhook 成功场景 = KP 旧 backup（warp 内容未清）
+                         *   仍指向原始前缀副本，链路完整；
+                         *   unhook 失败场景 = 入口仍为 KP pad，现状语义。
+                         *   两种场景 coexist patch 覆盖入口后均安全。 */
+                        pr_info("sehide: post-unhook entry "
+                                "%08x %08x %08x %08x %08x unexpected, coexist\n",
+                                f[0], f[1], f[2], f[3], f[4]);
+                    }
+                } else {
+                    pr_info("sehide: kp unhook symbol missing, coexist\n");
+                }
+                if (!bypassed) {
+                    /* coexist 回退（现状语义）：tramp 纯重定向 kp_replace，
+                     * KP pad 由主备份循环备份（此时入口已回到 KP pad）。 */
+                    se_aden_bak_n = (e[0] == 0xd50324dfu) ? 5 : 4;
+                    se_aden_mode = 3;
+                    pad_bti = (e[0] == 0xd50324dfu);
+                    pr_info("sehide: coexist mount on avc_denied (kp replace "
+                            "via trampoline) %016lx, kpform=%s\n",
+                            target, e[0] == 0xd50324dfu ? "A-bti5" : "B-nobti4");
+                }
+            }
         } else {
             /* 态② 原始入口 → direct 接管。序言白名单：PACIASP/PACIBSP/BTI*
              * 本身即间接跳转合法落点（架构规定 PACI 隐式授予 BTI），我们
@@ -912,11 +1513,16 @@ int se_decision_install(void)
                 break;
             default:
                 if ((e[0] >> 24u) == 0xa9u || (e[0] >> 24u) == 0xa8u ||
-                    e[0] == 0xd503201fu) /* STP 族 / NOP */
+                    (e[0] >> 24u) == 0xd1u ||
+                    e[0] == 0xd503201fu) /* STP 族 / SUB (imm)（4.19 clang
+                     * 常见栈帧开场 SUB SP,SP,#imm（d100c3ff）
+                     * / NOP——均 PC 无关，可安全复制 */
                     pad_bti = 0;
                 else {
                     pr_info("sehide: adenied entry %08x %08x %08x not a "
                             "prologue, refuse\n", e[0], e[1], e[2]);
+                    ((void (*)(void *))p_vfree)(se_va_buf);
+                    se_va_buf = 0;
                     return -2;
                 }
             }
@@ -932,6 +1538,8 @@ int se_decision_install(void)
     if (p_adenied_l3 && p_adenied_l3 != p_adenied) {
         pr_info("sehide: adenied sources disagree %016lx vs %016lx\n",
                 (se_u64)(se_ulong)p_adenied, (se_u64)(se_ulong)p_adenied_l3);
+        ((void (*)(void *))p_vfree)(se_va_buf);
+        se_va_buf = 0;
         return -3;
     }
 
@@ -942,11 +1550,17 @@ int se_decision_install(void)
      * 其中 LDR/BR 字面量形态属正常内容，PC 校验跳过。 */
     for (i = 0; i < se_aden_bak_n; i++) {
         if (se_kread(&se_aden_saved[i],
-                     (void *)(se_aden_target + (unsigned long)i * 4u), 4))
+                     (void *)(se_aden_target + (unsigned long)i * 4u), 4)) {
+            ((void (*)(void *))p_vfree)(se_va_buf);
+            se_va_buf = 0;
             return -1;
+        }
         if (se_aden_mode != 3 && se_insn_pc_related(se_aden_saved[i])) {
             pr_info("sehide: target inst[%d] %08x pc-relative, off\n",
                     i, se_aden_saved[i]);
+            se_kp_rehook_avc();
+            ((void (*)(void *))p_vfree)(se_va_buf);
+            se_va_buf = 0;
             return -4;
         }
     }
@@ -954,14 +1568,44 @@ int se_decision_install(void)
     /* inbound 判定 = KSU 规则集：类号/权限位按名解析自内核
      * secclass_map（钩子层序而非 policy 序 —— 详见 KSU 规则集段注释）。 */
 
+    /* S4 签名探针：位置编码图案 insns[i]=0xA0000000+i 经多词原语写入
+     * 模块 bss 16 字节，回读即得 (落点, insns 下标) 的真实配对映射——
+     * 直接观测 cb 行为而非推断。探针区无人执行零风险。 */
+    {
+        /* 探针数组同迁 va：sa1@+192 sv1@+224 sa2@+240 sv2@+272（sig 值
+         * 直接写 sv，回读 sv 即观测）。 */
+        void **sa1 = (void **)((unsigned long)se_va_buf + 192u);
+        se_u32 *sv1 = (se_u32 *)((unsigned long)se_va_buf + 224u);
+        void **sa2 = (void **)((unsigned long)se_va_buf + 240u);
+        se_u32 *sv2 = (se_u32 *)((unsigned long)se_va_buf + 272u);
+        int j, r1, r2;
+
+        for (j = 0; j < 4; j++) {
+            sa1[j] = (void *)((unsigned long)se_va_buf + 224u + (unsigned long)j * 4u);
+            sv1[j] = 0xA0000000u + (se_u32)j;
+            sa2[j] = (void *)((unsigned long)se_va_buf + 272u + (unsigned long)j * 4u);
+            sv2[j] = 0xA0000000u + (se_u32)j;
+        }
+        r1 = p_kp_hotpatch
+             ? ((int (*)(void **, se_u32 *, int))p_kp_hotpatch)(sa1, sv1, 4)
+             : -99;
+        r2 = p_patch_text
+             ? ((int (*)(void **, se_u32 *, int))p_patch_text)(sa2, sv2, 4)
+             : -99;
+        pr_info("sehide: sig hp rc=%d %08x %08x %08x %08x | pt rc=%d "
+                "%08x %08x %08x %08x (exp A0 A1 A2 A3)\n",
+                r1, sv1[0], sv1[1], sv1[2], sv1[3],
+                r2, sv2[0], sv2[1], sv2[2], sv2[3]);
+    }
+
     /* 组装 backup trampoline。mode=3（KP pad 在岗）：**纯重定向 4 词**
      * [LDR X17,#8; BR X17; quad(kp_replace)] —— 不复制任何指令，kp_replace
      * 从其真实入口原样执行（KP task_ext 授予零损失）。mode=1（direct）：
      * [0..bak_n-1] 复制落点前缀；[bak_n..+3] 绝对跳回 target+bak_n*4。
      * trampoline 位于本模块 .text，写入走内核 patch_text。 */
     {
-        void *taddrs[SE_ADEN_TRAMP_N];
-        se_u32 tinsns[SE_ADEN_TRAMP_N];
+        void **taddrs = (void **)((unsigned long)se_va_buf + 96u);
+        se_u32 *tinsns = (se_u32 *)((unsigned long)se_va_buf + 144u);
         int tn;
 
         if (se_aden_mode == 3) {
@@ -981,15 +1625,92 @@ int se_decision_install(void)
             tinsns[se_aden_bak_n + 2] = (se_u32)(back & 0xFFFFFFFFu);
             tinsns[se_aden_bak_n + 3] = (se_u32)(back >> 32u);
         }
-        for (i = 0; i < tn; i++)
-            taddrs[i] = (void *)(unsigned long)((unsigned long)se_aden_tramp +
-                                                (unsigned long)i * 4u);
-        rc = ((int (*)(void **, se_u32 *, int))p_patch_text)
-             (taddrs, tinsns, tn);
+        /* S4 鉴别实验②：单词写。多词数组传递已排除栈（全局数组同
+         * 错位）——两条多词原语（内核 fixmap / KP hotpatch cb）共享
+         * 的剩余环节 = 多词数组/cb 循环。单词写逐词独立调用，无数组
+         * stride 可错。tramp 区无人执行，写坏零危害。 */
+        if (p_kp_hpnosync) {
+            int (*wn)(void *, unsigned int) =
+                (int (*)(void *, unsigned int))(se_ulong)p_kp_hpnosync;
+
+            for (i = 0; i < tn; i++) {
+                volatile se_u32 *rv = (volatile se_u32 *)
+                    (unsigned long)((unsigned long)se_aden_tramp +
+                                    (unsigned long)i * 4u);
+
+                rc = wn((void *)(unsigned long)
+                        ((unsigned long)se_aden_tramp +
+                         (unsigned long)i * 4u), tinsns[i]);
+                pr_info("sehide: tramp w%d rc=%d rb=%08x exp=%08x\n",
+                        i, rc, *rv, tinsns[i]);
+                if (rc || *rv != tinsns[i]) {
+                    pr_info("sehide: tramp word-write FAIL @%d\n", i);
+                    rc = -1;
+                    break;
+                }
+            }
+            se_tramp_word_ok = (rc == 0);
+        } else {
+            for (i = 0; i < tn; i++)
+                taddrs[i] = (void *)(unsigned long)
+                            ((unsigned long)se_aden_tramp +
+                             (unsigned long)i * 4u);
+            if (p_kp_hotpatch)
+                rc = ((int (*)(void **, se_u32 *, int))p_kp_hotpatch)
+                     (taddrs, tinsns, tn);
+            else
+                rc = ((int (*)(void **, se_u32 *, int))p_patch_text)
+                     (taddrs, tinsns, tn);
+            se_tramp_word_ok = 0;
+        }
         if (rc) {
             pr_info("sehide: tramp patch rc=%d\n", rc);
+            se_kp_rehook_avc();
+            ((void (*)(void *))p_vfree)(se_va_buf);
+            se_va_buf = 0;
             return -5;
         }
+        /* 诊断：tramp 写入回读（patch_text 生效性实证）。 */
+        {
+            se_u32 tb[4];
+            int j;
+
+            for (j = 0; j < 4; j++)
+                tb[j] = 0;
+            if (!se_kread(&tb, (void *)se_aden_tramp, 16))
+                pr_info("sehide: tramp rb %08x %08x %08x %08x\n",
+                        tb[0], tb[1], tb[2], tb[3]);
+        }
+        /* 延迟回读：若 rb2 != rb，patch 之后有第三方写者改写了 tramp。 */
+        if (p_msleep_interruptible)
+            ((void (*)(se_ulong))p_msleep_interruptible)(10);
+        {
+            se_u32 tb2[4];
+            int j;
+
+            for (j = 0; j < 4; j++)
+                tb2[j] = 0;
+            if (!se_kread(&tb2, (void *)se_aden_tramp, 16))
+                pr_info("sehide: tramp rb2 %08x %08x %08x %08x\n",
+                        tb2[0], tb2[1], tb2[2], tb2[3]);
+            /* 回读校验闸门：单词写路径已在写入循环内逐词 volatile
+             * 验证（se_tramp_word_ok），此处 16B 块读仅作观测——
+             * 块读（probe_kernel_read）对刚写区域可返回
+             * 旋转视图，不能作为判据。多词路径仍用块读判定。 */
+            if (!se_tramp_word_ok &&
+                (tb2[0] != 0x58000051u || tb2[1] != 0xD61F0220u)) {
+                pr_info("sehide: tramp verify FAIL, abort (entry untouched)\n");
+                /* unhook 已发生：中止时必须把 KP hook
+                 * 装回，否则 KP root 放行悬空 + 决策面缺席 → su 域
+                 * SELinux 全 deny（"看似有 root 实则什么都干不了"）。 */
+                se_kp_rehook_avc();
+                ((void (*)(void *))p_vfree)(se_va_buf);
+                se_va_buf = 0;
+                return -5;
+            }
+        }
+        if (se_tramp_word_ok)
+            pr_info("sehide: tramp verified via word writes\n");
     }
 
     /* 写落点入口：[BTI JC 前缀（落点带 BTI 属性时）] + LDR X17/BR X17/
@@ -1007,19 +1728,169 @@ int se_decision_install(void)
         insns[0] = 0xd50324dfu;       /* BTI JC */
     }
     for (i = 0; i < se_aden_bak_n; i++)
-        addrs[i] = (void *)(se_aden_target + (unsigned long)i * 4u);
-    rc = ((int (*)(void **, se_u32 *, int))p_patch_text)(addrs, insns,
-                                                         se_aden_bak_n);
+        addrs[i] = (void *)(p_adenied + (unsigned long)i * 4u);
+    /* r11 内存自测①：模块 bss 纯 C store/load（同核、同 VA、无任何
+     * patch 原语参与）——判模块 data 区 store/load 基本可靠性。
+     * 位置签名图案错位即实锤 KPM 内存映射层异常（KP 加载器）。 */
+    {
+        static void *mt[4];
+        static se_u32 mw[4];
+
+        for (i = 0; i < 4; i++) {
+            mt[i] = (void *)(0xB0000000ul + (unsigned long)i * 4u);
+            mw[i] = 0xA0000000u + (se_u32)i;
+        }
+        pr_info("sehide: memtest ptr=%016lx %016lx %016lx %016lx "
+                "w=%08x %08x %08x %08x\n",
+                (se_u64)(se_ulong)mt[0], (se_u64)(se_ulong)mt[1],
+                (se_u64)(se_ulong)mt[2], (se_u64)(se_ulong)mt[3],
+                mw[0], mw[1], mw[2], mw[3]);
+        pr_info("sehide: memtest r =%016lx %016lx %016lx %016lx "
+                "rw=%08x %08x %08x %08x\n",
+                (se_u64)(se_ulong)mt[0], (se_u64)(se_ulong)mt[1],
+                (se_u64)(se_ulong)mt[2], (se_u64)(se_ulong)mt[3],
+                *(volatile se_u32 *)&mw[0], *(volatile se_u32 *)&mw[1],
+                *(volatile se_u32 *)&mw[2], *(volatile se_u32 *)&mw[3]);
+    }
+    /* r11 内存自测②：addrs 构造回读（闸门前的构造值快照）。 */
+    pr_info("sehide: addrs built %016lx %016lx %016lx %016lx (exp ...%lx +%lx+%lx+%lx)\n",
+            (se_u64)(se_ulong)addrs[0], (se_u64)(se_ulong)addrs[1],
+            (se_u64)(se_ulong)addrs[2], (se_u64)(se_ulong)addrs[3],
+            (se_u64)(se_ulong)p_adenied & 0xffffu,
+            (se_u64)(se_ulong)p_adenied >> 16 & 0xffffu, 0xfffful, 0xfffful);
+    /* 确定性闸门：写入地址必须逐词恒等于 p_adenied。历史会话曾观测到
+     * a0 = p_adenied+12（源码对该偏移无任何运算）——中间量传递
+     * 存在被改写路径，在写入前于源头直接比对拦截，绝不允许写到
+     * 函数中部。 */
+    if (addrs[0] != (void *)(se_ulong)p_adenied ||
+        addrs[se_aden_bak_n - 1] != (void *)(se_ulong)(p_adenied +
+        (unsigned long)(se_aden_bak_n - 1) * 4u)) {
+        pr_info("sehide: entry addr mismatch a0=%016lx aden=%016lx "
+                "a3=%016lx exp3=%016lx bak_n=%d, abort (entry untouched)\n",
+                (se_u64)(se_ulong)addrs[0],
+                (se_u64)(se_ulong)p_adenied,
+                (se_u64)(se_ulong)addrs[se_aden_bak_n - 1],
+                (se_u64)(se_ulong)(p_adenied +
+                (unsigned long)(se_aden_bak_n - 1) * 4u),
+                se_aden_bak_n);
+        se_kp_rehook_avc();
+        ((void (*)(void *))p_vfree)(se_va_buf);
+        se_va_buf = 0;
+        return -5;
+    }
+    /* 调用前完整快照（含第 5 词与首地址）。 */
+    pr_info("sehide: entry pre n=%d insns=%08x %08x %08x %08x | s4=%08x a0=%016lx\n",
+            se_aden_bak_n, insns[0], insns[1], insns[2], insns[3], insns[4],
+            (se_u64)(se_ulong)addrs[0]);
+    /* 写路径：tramp 单词写已验证成功 → entry 同法（逐词独立调用 +
+     * volatile 回读）；tramp 单词失败/无符号 → 多词 hotpatch（闸门
+     * 兜底）。 */
+    if (se_tramp_word_ok && p_kp_hpnosync) {
+        int (*wn)(void *, unsigned int) =
+            (int (*)(void *, unsigned int))(se_ulong)p_kp_hpnosync;
+
+        rc = 0;
+        for (i = 0; i < se_aden_bak_n; i++) {
+            volatile se_u32 *rv = (volatile se_u32 *)addrs[i];
+
+            int w = wn(addrs[i], insns[i]);
+
+            pr_info("sehide: entry w%d rc=%d rb=%08x exp=%08x\n",
+                    i, w, *rv, insns[i]);
+            if (w || *rv != insns[i]) {
+                pr_info("sehide: entry word-write FAIL @%d\n", i);
+                rc = -1;
+                break;
+            }
+        }
+    } else if (p_kp_hotpatch) {
+        rc = ((int (*)(void **, se_u32 *, int))p_kp_hotpatch)(addrs, insns,
+                                                              se_aden_bak_n);
+    } else {
+        rc = ((int (*)(void **, se_u32 *, int))p_patch_text)(addrs, insns,
+                                                             se_aden_bak_n);
+    }
     if (rc) {
         pr_info("sehide: entry patch rc=%d\n", rc);
+        /* 多条补丁可能部分落盘——无条件写回备份恢复原始前缀
+         * （patched 守卫未置位，restore 内部有门槛，此处直接置位）。 */
+        se_aden_patched = 1;
+        se_aden_restore();
+        se_kp_rehook_avc();
+        ((void (*)(void *))p_vfree)(se_va_buf);
+        se_va_buf = 0;
         return -6;
     }
     se_aden_patched = 1;
+    for (i = 0; i < se_aden_bak_n; i++)
+        se_aden_live[i] = insns[i];
+
+    /* 诊断：入口写入回读（patch 后立即读实际生效内容）。 */
+    {
+        se_u32 rb[5];
+        int j;
+
+        for (j = 0; j < 5; j++)
+            rb[j] = 0;
+        if (!se_kread(&rb, (void *)(se_aden_target),
+                      (unsigned long)se_aden_bak_n * 4u))
+            pr_info("sehide: entry rb %08x %08x %08x %08x %08x (n=%d)\n",
+                    rb[0], rb[1], rb[2], rb[3], rb[4], se_aden_bak_n);
+    }
+    /* 延迟回读：若与首次回读不一致，说明 patch 之后有第三方写者改写了
+     * 落点。
+     * 注意：若落盘错位已发生，此延迟窗口内系统处于危险态，
+     * 其他 CPU 的任何 denial 都会触发崩溃——但 rb2 打印在
+     * selftest 之前，崩溃前必已落 printk 环形缓冲。 */
+    if (p_msleep_interruptible)
+        ((void (*)(se_ulong))p_msleep_interruptible)(10);
+    {
+        /* 校验判据 = volatile 逐词读（16B 块读对内核
+         * text 刚写区域返回旋转视图，不可作判据；单词路径在写入
+         * 循环内已逐词验证，此处复验一次延迟态）。 */
+        int ok = 1;
+        int j;
+
+        for (j = 0; j < se_aden_bak_n; j++) {
+            volatile se_u32 *rv = (volatile se_u32 *)addrs[j];
+
+            if (*rv != insns[j]) {
+                ok = 0;
+                break;
+            }
+        }
+        pr_info("sehide: entry verify2 ok=%d rb=%08x %08x %08x %08x\n",
+                ok, *(volatile se_u32 *)addrs[0],
+                *(volatile se_u32 *)addrs[1],
+                *(volatile se_u32 *)addrs[2],
+                *(volatile se_u32 *)addrs[3]);
+        if (!ok) {
+            pr_info("sehide: entry verify FAIL, restore+rehook\n");
+            pr_info("sehide: verify dbg a0=%016lx a3=%016lx aden=%016lx "
+                    "tgt=%016lx\n",
+                    (se_u64)(se_ulong)addrs[0],
+                    (se_u64)(se_ulong)addrs[se_aden_bak_n - 1],
+                    (se_u64)(se_ulong)p_adenied,
+                    (se_u64)(se_ulong)se_aden_target);
+            se_aden_patched = 1;
+            se_aden_restore();
+            se_kp_rehook_avc();
+            ((void (*)(void *))p_vfree)(se_va_buf);
+            se_va_buf = 0;
+            return -6;
+        }
+    }
 
     /* 活体自检：出厂对 (init → su, binder, 全权) 必 deny（AccessTest
-     * 实测 init→su binder 全 deny），rc==0 当且仅当我们的 hook 在岗
+     * init→su binder 全 deny），rc==0 当且仅当我们的 hook 在岗
      * （all_allow_sid 不放行该 inbound）——唯一归因。
      * 失败 → 恢复落点前缀 → 引擎 off。 */
+    /* r17 修复：selftest 的翻转路径依赖 G4 init 全类规则（se_ksu_rule
+     * _mask），规则表必须先于 selftest 就绪——原调用点在 selftest 之后
+     * （表 deferred → mask=0 → 出厂 -13 → 永久降级）。
+     * se_ksu_recal 内含 scm 解析（仅内核符号依赖）+ 表建 + sid 解析，
+     * 幂等，此处失败不阻断 selftest（表缺失 = 走原降级路径）。 */
+    se_ksu_recal();
     if (p_secctx_to_sid)
         ((int (*)(const char *, se_u32, se_u32 *))p_secctx_to_sid)
             ("u:r:init:s0", sizeof("u:r:init:s0") - 1u, &init_sid);
@@ -1033,6 +1904,9 @@ int se_decision_install(void)
         pr_info("sehide: selftest prerequisites missing (st=%016lx init=%u cls=%u)\n",
                 (se_u64)(se_ulong)p_selinux_state, init_sid, binder_cls);
         se_aden_restore();
+        se_kp_rehook_avc();
+        ((void (*)(void *))p_vfree)(se_va_buf);
+        se_va_buf = 0;
         return -7;
     }
     {
@@ -1040,6 +1914,9 @@ int se_decision_install(void)
 
         /* avc_has_perm：<=6.3 六参带 state，v6.4 起五参（同一个
          * state 全局单例化改动）。按静态版本表分派，不写死 6 参。 */
+        pr_info("sehide: selftest begin st=%016lx s=%u t=%u c=%u r=%x sh=%d\n",
+                (se_u64)(se_ulong)p_selinux_state, init_sid, g_su_sid,
+                binder_cls, 0xfu, (int)se_kver_aden());
         if (se_kver_has_state())
             src = ((int (*)(void *, se_u32, se_u32, se_u16, se_u32, void *))
                    p_ahp)((void *)(se_ulong)p_selinux_state,
@@ -1053,6 +1930,9 @@ int se_decision_install(void)
         if (src != 0) {
             pr_info("sehide: decision selftest FAILED rc=%d, engine off\n", src);
             se_aden_restore();
+            se_kp_rehook_avc();
+            ((void (*)(void *))p_vfree)(se_va_buf);
+            se_va_buf = 0;
             return -8;
         }
         pr_info("sehide: decision selftest ok (rc=0 via our flip)\n");
@@ -1062,12 +1942,83 @@ int se_decision_install(void)
      * 不阻塞装机——判定全 0 = 透传出厂（fail-closed），dmesg 可见。 */
     se_ksu_recal();
 
+    /* KP slow_avc_audit unhook：审计路径恢复原生（决策面对 su/comp
+     * 翻转清 auditdeny 位 → allow 不进审计慢路径；非相关 deny = 出厂
+     * 语义）。独立失败仅告警，不影响决策面。 */
+    if (p_slow_audit && p_kp_unhook) {
+        se_u32 s0 = 0, s1 = 0, s2 = 0, sq0 = 0, sq1 = 0;
+        unsigned long strep;
+
+        if (!se_kread(&s0, (void *)(se_ulong)p_slow_audit, 4) &&
+            !se_kread(&s1, (void *)(se_ulong)(p_slow_audit + 4), 4) &&
+            !se_kread(&s2, (void *)(se_ulong)(p_slow_audit + 8), 4) &&
+            ((s0 == 0xd50324dfu && s1 == 0x58000051u) ||
+             (s0 == 0x58000051u && s1 == 0xd61f0220u)) &&
+            !se_kread(&sq0, (void *)(se_ulong)(p_slow_audit + 12), 4) &&
+            !se_kread(&sq1, (void *)(se_ulong)(p_slow_audit + 16), 4)) {
+            /* 形态 1（[BTI_JC,LDR,BR,lo,hi]）：quad 在 +12/+16；
+             * 形态 2（[LDR,BR,lo,hi]）：lo 在 +8、hi 在 +12。 */
+            strep = (s0 == 0xd50324dfu)
+                    ? ((unsigned long)sq0 | ((unsigned long)sq1 << 32u))
+                    : ((unsigned long)s2 | ((unsigned long)sq0 << 32u));
+            if ((strep >> 48u) == 0xffffu) {
+                ((void (*)(void *))p_kp_unhook)((void *)(se_ulong)p_slow_audit);
+                se_kp_slow_replace = strep;
+                se_kp_slow_unhooked = 1;
+                pr_info("sehide: kp slow_avc_audit unhooked (replace %016lx)\n",
+                        strep);
+            }
+        }
+    }
+
+    /* KP SELinux 层全量卸载：决策面接管期间任何 SELinux 路径上
+     * 不得保留 KP 钩子，与 selinux_hide 开关状态无关。钩子全集：
+     * SELinux 层的钩子全集 = avc_denied/slow_avc_audit（bypass_selinux
+     * 无条件装，上面已卸）+ security_load_policy（selinux_sepolicy.c
+     * 无条件装）+ selinux_hide 使能时五点（sel_write_context/access、
+     * selinux_setprocattr、sel_read/mmap_handle_status）。KP unhook()
+     * 对未挂钩地址是安全 no-op（hook.c:640 无记录直接返回），逐点调用
+     * 即可实现"有则卸、无则跳"。独立失败仅告警，不阻断主链。
+     * 注意：内核符号必须走 se_sym（内核 kallsyms 解析链）——
+     * symbol_lookup_name 只搜 KP 自有符号表，对内核符号恒返回 0
+     * ）。 */
+    if (p_kp_unhook) {
+        static const char *const seh_names[] = {
+            "security_load_policy",
+            "selinux_setprocattr",
+            "sel_write_context",
+            "sel_write_access",
+            "sel_read_handle_status",
+            "sel_mmap_handle_status",
+        };
+        unsigned int ui;
+
+        for (ui = 0; ui < sizeof(seh_names) / sizeof(seh_names[0]); ui++) {
+            unsigned long fa = se_sym(seh_names[ui]);
+
+            if (fa && (fa >> 48u) == 0xffffu) {
+                ((void (*)(void *))p_kp_unhook)((void *)fa);
+                pr_info("sehide: kp %s unhooked @%016lx\n",
+                        seh_names[ui], (se_u64)fa);
+            }
+        }
+    }
+
+    /* 写入完成，参数数组使命结束——释放 va（决策面运行期不依赖）。 */
+    ((void (*)(void *))p_vfree)(se_va_buf);
+    se_va_buf = 0;
+
     se_decision_on = 1;
     pr_info("sehide: decision-plane flip on (mode=%s avc_denied=%016lx "
             "target=%016lx su=%u comp=%u)\n",
             se_aden_mode == 1 ? "direct" : "coexist",
             (se_u64)(se_ulong)p_adenied, (se_u64)se_aden_target,
             g_su_sid, g_comp_sid);
+    /* 第二接管点：域翻译（生态注入域别名 su 域）。独立失败仅告警。 */
+    rc = se_sec_install();
+    if (rc)
+        pr_info("sehide: secctx takeover skipped rc=%d (su setcon may fail "
+                "for injected domains)\n", rc);
     return 0;
 }
 

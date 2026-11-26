@@ -134,7 +134,13 @@ int se_kwrite(void *dst, const void *src, se_ulong n)
  */
 int se_kptr_ok(se_u64 v)
 {
-    return (v >> 48) == 0xffffull && v != 0xffffffffffffffffull;
+    /* ERR_PTR(-1..-MAX_ERRNO) = 0xfffffffffffffff1..ff 与内核指针同处
+     * 0xffff 高位带——仅查 >>48 会放行负错误码（filp_open 的
+     * -EACCES 曾以 ERR_PTR 直达 filp_close 引发 NULL+0x2b 崩溃）。
+     * 加 MAX_ERRNO(4095) 区间排除。 */
+    return (v >> 48) == 0xffffull &&
+           v < 0xfffffffffffff000ull &&
+           v != 0xffffffffffffffffull;
 }
 
 /* ---------------- 结构推导：symtab 与 te_avtab ---------------- */

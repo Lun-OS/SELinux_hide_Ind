@@ -144,7 +144,7 @@ int se_shadow_init(void)
     }
 
     /*
-     * linear 映射偏移改用 KP 的运行期实测值。
+     * linear 映射偏移改用 KP 的运行期标定值。
      */
     {
         unsigned long kp_lvoff = symbol_lookup_name("linear_voffset");

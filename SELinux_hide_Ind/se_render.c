@@ -187,10 +187,12 @@ int se_parse_ctx(char *buf, void *ctxbuf)
      * 5 段 = MLS 形态 "u:r:type:sens:cats"（真实 app 域全部带
      * 类别，如 u:r:platform_app:s0:c512,c768）。此前一律拒绝（-SE_STR_MLS）
      * 导致带类别的特权查询恒 -22（SystemUI 等 attach 循环崩的直接机制，
-     * 实测 T2 wr=1 / T3 无 MLS 版 wr=0 复现）。MLS 段跳过：range 置零
+     * T2 wr=1 / T3 无 MLS 版 wr=0）。MLS 段跳过：range 置零
      * （parse 开头已 memset），求值走 type（Android app 边几乎不含
-     * mlsconstrain，实测 T3 副本答案 allow 与出厂一致）；MLS 精确
-     * 填充（sens symtab + cat ebitmap）留待实测需要时再做。
+     * mlsconstrain，T3 副本答案与出厂一致）；MLS 精确
+     * 填充（sens symtab + cat ebitmap）留待有需要时再做。仅特权路径
+     * 受影响：副本查询只服务特权 blob 吸收后的判定，非特权路径走
+     * live 原版，与副本 MLS 无关。
      */
     if (n > 5)
         return SE_STR_MLS;   /* 6 段以上：结构异常 */
@@ -349,8 +351,8 @@ int se_compute_av(void *sctx, void *tctx, se_u32 tclass,
      * v6.17 起（不是 6.18）在 permissive_map 和 len 之间多了
      * neveraudit_map（v6.17/v6.18 policydb.h:303，v6.12 无），两位都命中
      * 时直接全通（services.c:1158-1161）。
-     * 这里用的是 se_calibrate() 实测的数据布局间距，不是函数形状分派：
-     * 静态版本表只管调用 ABI，数据布局仍以实测为准，
+     * 这里用的是 se_calibrate() 标定出的数据布局间距，不是函数形状分派：
+     * 静态版本表只管调用 ABI，数据布局以运行期标定为准，
      * 避免厂商回移版本号骗过判据。间距 32 = 中间多一个 ebitmap(16B)。
      */
     if (p_get_bit && L.perm && L.lenoff == L.perm + 32u &&

@@ -19,10 +19,10 @@ int se_read_policy(void **out, se_ulong *out_len)
      * 签名分界（v-fix 复审 20261104：v6.3~v6.7 tag 原始行+文件指纹校验）：
      *   4.19~v6.3（含 stable 4.19.325 / 5.10.245 / 6.1.191 / mainline v6.3）
      *     security_read_policy(state, data, len)          —— 三参
-     *   v6.4 起（mainline v6.4 tag :3948 原始行实测，state 全局单例化
+     *   v6.4 起（mainline v6.4 :3948 起，state 全局单例化
      *     `struct selinux_state *state = &selinux_state;`）
      *     security_read_policy(data, len)                 —— 两参
-     * 旧判据 6.6 错误：当时实测了 4.19.325/5.10.245/6.1.191/6.6.161 四点
+     * 旧判据 6.6 错误：仅覆盖 4.19.325/5.10.245/6.1.191/6.6.161 四点
      * （全对）但漏测 6.4/6.5，从四点线性推断分界 6.6。6.4/6.5 上若按三参
      * 调两参函数，state 指针会被函数当作 data 出参 → `*len` 写坏
      * selinux_state 头 8B → Oops（内存破坏级）。
@@ -730,8 +730,8 @@ int se_symtab_from_avtab(const se_u8 *copy)
             }
             /*
              * nprim 允许为 0：bools 表（SYM_BOOLS）在没开任何布尔时就是空的。
-             * 4.19 实测 nprim = 5/103/4/3359/1/0/1/1024；
-             * 6.1 GKI 实测（fp_br21 dump）：5/107/4/5118/1/0/1/1024
+             * 观测值：4.19 = 5/103/4/3359/1/0/1/1024；
+             * 6.1 GKI：5/107/4/5118/1/0/1/1024
              * （SYM_TYPES=3，Android 重排，types 表 nprim=5118 >= su_type+1）。
              */
             if (nprim > 0x100000u) {
@@ -817,9 +817,8 @@ int se_derive_layout(void)
 
     /*
      * 推导顺序：
-     * 1) inline hook 探针（内核自己交出 avtab 地址，最可靠——实测
-     *    全绿的路径）。代价是装机早期写一次 .text：MKP/写保护机型
-     *    当场死（text 写必死红线）——pstore 崩溃证明下游直接消费
+     * 1) inline hook 探针（内核自己交出 avtab 地址，最可靠）。代价是
+     *    装机早期写一次 .text：写保护机型会直接崩溃——下游直接消费
      *    扫描值的风险远高于探针：错位值骗过不变式校验后写坏 live。
      *    非 MKP 机型（4.19 vendor 全系）走此路径；MKP 机的安全探针另案。
      * 2) 反解（纯读）：探针不可用时。

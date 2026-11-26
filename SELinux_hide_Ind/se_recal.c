@@ -354,6 +354,7 @@ bad:
 static void *g_recal_task;
 int g_recal_worker_ready;
 static int g_recal_pin_done;   /* start 期绑核已成功（fn 不再重复尝试） */
+static int g_patrol_dead;      /* uptime 超阈值后周期巡检永久停止 */
 
 /*
  * kthread 绑核：把模块自有 kthread 钉在单核，调度干扰集中到该核，
@@ -389,7 +390,7 @@ static int se_recal_worker_fn(void *arg)
      * （4.19 core.c:1083 唯一 EINVAL 路径：cpumask_any_and
      * (cpu_online_mask) 无交集——启动期逐核上线晚于 sehide_init），
      * 此处周期重试直到成功；30 次（~30s）封顶后放弃。 */
-    /* start 期已成功绑核则跳过首循环补试（消重：此前同一次启动打
+    /* start 期已成功绑核则跳过首循环补试（避免同一次启动打印
      * 两条 pinned 日志）；未成功才补试，之后周期重试 30 次封顶。 */
     pin_rc = g_recal_pin_done ? 0 :
              (g_recal_task ? se_worker_pin("recal worker", g_recal_task) : -1);
@@ -416,14 +417,37 @@ static int se_recal_worker_fn(void *arg)
          * 指纹自愈与组件域升级由本线程周期巡检完成（进程上下文，
          * 可睡眠；~512 个空闲轮 × 8ms ≈ 4.1s 一次）。旗置位事件
          * （决策面/门）仍即时响应，巡检只兜底无事件窗口。 */
-        if ((tick & 0x1ffu) == 0u && L.ok && !g_degraded) {
+        /* 周期巡检仅限启动初期：uptime 超过 60s 后入口/指纹/组件域
+         * 均已稳定，事件驱动路径（旗置位）足以覆盖后续状态变化，
+         * 周期扫描停止以消除常驻线程的持续内核读与日志噪声。
+         * 归属说明：巡检是后台自检线程，不属于特权/非特权任一请求
+         * 路径；停用后两条路径的行为与时序均不变。 */
+        if (!g_patrol_dead && (tick & 0x1ffu) == 0u) {
+            if (p_ktime_get_seconds &&
+                ((long long (*)(void))p_ktime_get_seconds)() >= 60) {
+                g_patrol_dead = 1;
+                pr_info("sehide: periodic patrol disabled (uptime > 60s)\n");
+            } else if (L.ok && !g_degraded) {
+            /* 入口在岗巡检 + 自愈（被还原 = 决策面失明，su 无兜底全灭）。
+             * 仅漂移/自愈/失败才打印。 */
+            if (se_decision_enabled()) {
+                int erc = se_decision_entry_check();
+                static int edbg_n;
+
+                if (erc && edbg_n < 8u) {
+                    edbg_n++;
+                    pr_info("sehide: entry check rc=%d (1=healed, <0=fail)\n",
+                            erc);
+                }
+            }
             if (!se_live_ok())
                 se_recalibrate();
             else
                 se_comp_upgrade();
+            }
         }
         /* status freeze 延迟补装：selinuxfs 挂载可能晚于首个 exec
-         * （OP60F9L1 实证 3.7s 内核态读 enforce 失败）；安装本身只做
+         * （实测启动早期 3.7s 内核态读 enforce 失败）；安装本身只做
          * 文件读 + 数据槽写，进程上下文安全。巡检节拍 ~4.1s，5 次封顶。 */
         if (status_try < 5u && (tick & 0x1ffu) == 0u && L.ok &&
             !se_status_ready()) {
@@ -456,7 +480,7 @@ int se_recal_worker_start(void)
     g_recal_task = t;
     g_recal_worker_ready = 1;
     /* start 期绑核；成功登记 g_recal_pin_done，fn 首循环不再重复
-     * （消重）。失败留给 fn 自重试（CPU7 未 online 场景）。 */
+     * ）。失败留给 fn 自重试（CPU7 未 online 场景）。 */
     if (!se_worker_pin("recal worker", t))
         g_recal_pin_done = 1;
     ((int (*)(void *))p_wake_up_process)(t);

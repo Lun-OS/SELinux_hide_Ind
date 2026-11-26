@@ -53,3 +53,11 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Project artifacts: commits are code-only
+.log/
+docs/
+build/
+*.kpm
+SELinux_hide_Ind/_dis/
+SELinux_hide_Ind/kpmsyms_full.txt

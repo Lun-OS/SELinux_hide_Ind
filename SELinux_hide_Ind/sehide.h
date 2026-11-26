@@ -1,5 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
+ * 路径术语（全项目注释统一口径，避免混淆）：
+ * - 特权路径：su / comp（su、magisk 域）相关任务发起的 SELinux 请求，
+ *   由决策面翻转或门放行。
+ * - 非特权路径：普通（非 su/comp）任务的 SELinux 请求，决策面仅做
+ *   一次分诊后透传内核原版；门的权限检查与出厂语义一致。
+ * - KP 行为优化：作用于 KP 自身机制（如 task_ext、trusted-manager），
+ *   不改变任何 SELinux 判定结果，也不影响上述两条路径的语义。
+ * 未实现/降级的能力必须注明其归属路径；未标注即视为对两条路径均有影响。
  *
  * 分层：se_util / se_symbol / se_layout / se_policydb / se_rules /
  *   se_render / se_gate / se_bprm / se_recal / sehide_main
@@ -235,6 +243,7 @@ extern unsigned long p_wake_up_process;
 extern unsigned long p_kthread_should_stop;
 extern unsigned long p_kthread_stop;
 extern unsigned long p_msleep_interruptible;   /* blob 类型声明注入 live symtab */
+extern unsigned long p_ktime_get_seconds;
 extern unsigned long p_set_cpus_allowed_ptr;   /* kthread 绑核（调度隔离，4.19~6.6 core.c T 段实证） */
 extern unsigned long p_flex_prealloc; /* type_attr_map_array 扩容（policydb_write 序列化安全） */
 extern unsigned long p_flex_get;      /* 新槽定位（导出真函数，4.19 kallsyms T） */
@@ -279,6 +288,9 @@ extern unsigned long p_avc_reset;
 extern unsigned long p_avc_struct;
 extern unsigned long p_kp_hook;
 extern unsigned long p_kp_unhook;
+extern unsigned long p_kp_hotpatch;
+extern unsigned long p_kp_hpnosync;
+extern unsigned long p_slow_audit;   /* slow_avc_audit（KP unhook 恢复原生审计路径用） */
 extern unsigned long p_kuid;
 extern unsigned long p_set_sec_override;   /* 内核 set_security_override（组件域切轨） */
 /* 新增绑定（改①②）：写劫持与内核文件读取 */
@@ -378,6 +390,7 @@ int se_clear_allow_at(void *pdb, se_u32 src, se_u32 tgt, se_u32 cls, se_u32 bits
  * （源=su/comp）全类 / inbound 白名单六类 → 改 avd + return 0，不写缓存。
  * 原理与撤销理由见 se_decision.c 头注释（全 verbatim）。 */
 int se_decision_install(void);   /* install 期调用；g_su_sid/g_comp_sid 标定之后 */
+int se_decision_entry_check(void); /* recal 巡检：入口在岗校验+自愈 */
 void se_decision_uninstall(void); /* 模块卸载：patch_text 恢复 KP replace 前缀 */
 void se_decision_recalibrate(void); /* policy 重载后刷新 inbound 白名单 */
 int se_perm_tab_build(void);     /* secclass_map 预建翻译表（build_copy 尾） */

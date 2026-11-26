@@ -392,7 +392,7 @@ int se_load_worker_start(void)
         return -1;
     se_load_task = t;
     /* start 期绑核；成功则登记 999 封顶，worker 首循环不再重复尝试
-     * （消重：此前同一次启动会打印两条 pinned 日志）。失败留给
+     * （避免同一次启动打印两条 pinned 日志）。失败留给
      * worker 自重试（CPU7 未 online 场景）。 */
     se_load_pin_rc = se_worker_pin("load worker", t);
     if (!se_load_pin_rc)
@@ -822,7 +822,7 @@ static void se_uninstall_read_gate(void)
 /* 卸载还原。把 write_op[] 中仍指向我们 wrapper 的槽写回原函数。
  * 幂等：找不到（未装/已还原）静默跳过。模块退出后槽位绝不能悬空指向
  * 已释放的模块内存。
- * 流程红线：链接期未解析符号编译静默——每次产物必须 nm -u 对比基线 */
+ * 注意：链接期未解析符号不报错——发布前须用 nm -u 核对未解析符号列表 */
 static void se_restore_slot(unsigned long base, void *ours, void *orig, const char *tag)
 {
     se_u32 i;

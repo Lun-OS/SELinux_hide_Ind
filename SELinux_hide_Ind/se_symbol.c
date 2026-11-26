@@ -26,7 +26,7 @@ int walk_cb(void *data, const char *name, struct module *mod, unsigned long addr
 /*
  * 三级符号解析链。
  *
- * 6.1 GKI 装机（fp_br21）实证：KP 填给 KPM 的 kallsyms_lookup_name 函数
+ * 6.1 GKI 装机实证：KP 填给 KPM 的 kallsyms_lookup_name 函数
  * 指针在 GKI 6.1.157 上失效（security_read_policy/selinux_state 解析出
  * 错误地址 -> security_read_policy 返回 -EINVAL -> 引擎 off），而 KP 自己
  * 的 kallsyms_lookup_name_by_suffix（start.c:212，先查 KP 符号表、再内核
@@ -202,6 +202,7 @@ unsigned long p_eval_cond_node; /* evaluate_cond_node（4.19 单数版） */
 unsigned long p_kwrite;       /* copy_to_kernel_nofault */
 unsigned long p_adenied;      /* avc_denied 最终地址（经 patch_config 链解析） */
 unsigned long p_adenied_l3;   /* L3 直查的 avc_denied（与 patch_config 互证备用） */
+unsigned long p_slow_audit;   /* slow_avc_audit（KP unhook 恢复原生审计路径用） */
 unsigned long p_patch_text;   /* 内核 aarch64_insn_patch_text（挂载/卸载执行原语） */
 unsigned long p_ahp;          /* avc_has_perm（决策面活体自检用，全局 T 符号） */
 unsigned long p_pdb_write;
@@ -216,6 +217,7 @@ unsigned long p_wake_up_process;
 unsigned long p_kthread_should_stop;
 unsigned long p_kthread_stop;
 unsigned long p_msleep_interruptible;
+unsigned long p_ktime_get_seconds;
 unsigned long p_set_cpus_allowed_ptr;
 unsigned long p_flex_prealloc;
 unsigned long p_flex_get;
@@ -261,7 +263,7 @@ unsigned long p_kfree;
  * avc 缓存刷新（重载自愈的最后一步）。规律全部来自各版本源码核对：
  *   - avc_ss_reset：4.19/5.4/5.10/5.15/6.1/6.2/6.3 均为双参
  *     (struct selinux_avc *avc, u32 seqno)；v6.4 起单参 (u32 seqno)
- *     ——v-fix 复审 20261104：v6.4 tag 三处实测一致（avc_ss.h 声明 +
+ *     ——v6.4 判据三处一致（avc_ss.h 声明 +
  *     services.c:2165 + selinuxfs.c:175 调用形态），旧注按 commit 归
  *     6.5 属误判（merge window 实为 6.4）。
  *   - 内部 avc_flush 的 avc_node_delete 自 4.19 到 6.12 一律 call_rcu
@@ -317,6 +319,8 @@ struct sym_slot syms[34] = {
 
 unsigned long p_kp_hook;
 unsigned long p_kp_unhook;
+unsigned long p_kp_hotpatch;   /* KP 静默多词补丁（KP_EXPORT_SYMBOL，stop_machine last-master）*/
+unsigned long p_kp_hpnosync;   /* KP 单词补丁（alias-PTE + 直接写，无 stop_machine）*/
 
 /*
  * current_uid 也是 KernelPatch 导出符号（utils.c:172 KP_EXPORT_SYMBOL），
@@ -400,7 +404,7 @@ void se_bind_symbols(void)
     p_kwrite         = se_sym("copy_to_kernel_nofault");
     /* copy_to_kernel_nofault 是 v5.8 改名（旧名 probe_kernel_write），
      * 4.19 上查不到 → p_kwrite=0 → se_kwrite 恒 -1 → 门输出恒 fallback
-     * （br_0713 定案：lspd addService SecurityException、find denied
+     * （症状：lspd addService SecurityException、find denied
      * flags=0 回落 live）。回退绑定与 p_kread 既有两级回退对称；
      * 4.19 mm/maccess.c:51 probe_kernel_write 三参同 ABI、0=成功。 */
     if (!p_kwrite)
@@ -443,7 +447,33 @@ void se_bind_symbols(void)
         if (!p_adenied)
             pr_info("sehide: avc_denied unresolved via all paths\n");
     }
-    /* KP replace 地址不走符号表（kpimg 私有符号不可达，装机实测），
+    /* slow_avc_audit：kallsyms 直名（noinline 全局函数，与 avc_denied
+     * 同款）。patch_config+96 可达时作互证，不一致置 0 拒 unhook。 */
+    {
+        unsigned long sa = se_sym("slow_avc_audit");
+        unsigned long pc_sym2 = se_sym("patch_config");
+        unsigned long pc_ptr2 = 0, slow_pc = 0;
+
+        p_slow_audit = 0;
+        if (sa && ((sa >> 48u) == 0xffffu)) {
+            p_slow_audit = sa;
+            pr_info("sehide: slow_avc_audit via kallsyms %016lx\n", sa);
+        }
+        if (pc_sym2 && se_kptr_ok(pc_sym2) &&
+            !se_kread(&pc_ptr2, (void *)pc_sym2, 8) && se_kptr_ok(pc_ptr2) &&
+            !se_kread(&slow_pc, (void *)(pc_ptr2 + 96u), 8) && se_kptr_ok(slow_pc) &&
+            ((slow_pc >> 48u) == 0xffffu)) {
+            if (!p_slow_audit) {
+                p_slow_audit = slow_pc;
+                pr_info("sehide: slow_avc_audit via patch_config %016lx\n", slow_pc);
+            } else if (p_slow_audit != slow_pc) {
+                pr_info("sehide: slow_audit sources disagree %016lx vs %016lx, refuse\n",
+                        p_slow_audit, slow_pc);
+                p_slow_audit = 0;
+            }
+        }
+    }
+    /* KP replace 地址不走符号表（kpimg 私有符号不可达），
      * 由 install 从 avc_denied 入口的 KP 补丁内嵌 quad 反推
      * （hook.c:309-316 格式 verbatim，内核形态校验）。 */
     p_patch_text     = se_sym("aarch64_insn_patch_text");
@@ -460,7 +490,8 @@ void se_bind_symbols(void)
     p_wake_up_process        = se_sym("wake_up_process");
     p_kthread_should_stop    = se_sym("kthread_should_stop");
     p_kthread_stop           = se_sym("kthread_stop");
-    p_msleep_interruptible   = se_sym("msleep_interruptible");  /* ss/hashtab.c 非静态，kallsyms T */
+    p_msleep_interruptible   = se_sym("msleep_interruptible");
+    p_ktime_get_seconds      = se_sym("ktime_get_seconds");   /* 巡检基础设施，不属任何请求路径 */
     /* set_cpus_allowed_ptr：sched/core.c 全局 T（4.19:1125 / 5.10:2080 /
      * 6.1:2985 / 6.6:3223 实证）。缺符号 = 不绑核，行为同旧版。 */
     p_set_cpus_allowed_ptr   = se_sym("set_cpus_allowed_ptr");
@@ -554,6 +585,8 @@ void se_bind_symbols(void)
     /* KernelPatch 自己的符号要走 KP 的符号表，内核 kallsyms 里没有 */
     p_kp_hook        = symbol_lookup_name("hook");
     p_kp_unhook      = symbol_lookup_name("unhook");
+    p_kp_hotpatch    = symbol_lookup_name("hotpatch");
+    p_kp_hpnosync    = symbol_lookup_name("hotpatch_nosync");
     p_kuid           = symbol_lookup_name("current_uid");
     /* KP 全表按名遍历 API（start.c:161 KP_EXPORT_SYMBOL，内部
      * 已处理 6.1 的 nomod 签名）——D 段数据符号的可靠解析通道
@@ -577,7 +610,7 @@ void se_bind_symbols(void)
     /* KP 的后缀解析器（KP_EXPORT_SYMBOL，KP 符号表必有）——
      * GKI 6.x 上 kallsyms_lookup_name 函数指针失效时的第三级回退 */
     p_ksym_by_suffix = symbol_lookup_name("kallsyms_lookup_name_by_suffix");
-    pr_info("sehide: kp hook=%016lx unhook=%016lx current_uid=%016lx\n",
-            p_kp_hook, p_kp_unhook, p_kuid);
+    pr_info("sehide: kp hook=%016lx unhook=%016lx hotpatch=%016lx hpnosync=%016lx current_uid=%016lx\n",
+            p_kp_hook, p_kp_unhook, p_kp_hotpatch, p_kp_hpnosync, p_kuid);
 }
 

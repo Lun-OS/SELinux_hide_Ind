@@ -3,12 +3,14 @@
 #include "sehide.h"
 
 KPM_NAME("SELinux_hide_Ind");
-KPM_VERSION("1.1.2");
+KPM_VERSION("1.1.3");
 KPM_LICENSE("AGPL v3");
 KPM_AUTHOR("Lun.");
 KPM_DESCRIPTION("github@Lun-OS ; Built-in the boot to achieve cleaner SELinux_hide");
 
-static const char *se_ver = "1.1.2";
+/* 日志区分串（仅 dmesg 可见）：KPM_VERSION 元数据保持 1.1.3 不变，
+ * dev 后缀用于区分同版本串的连续修复构建。 */
+static const char *se_ver = "1.1.3";
 
 long sehide_init(const char *args, const char *event, void *__user reserved)
 {
@@ -17,6 +19,8 @@ long sehide_init(const char *args, const char *event, void *__user reserved)
     (void)args;
     (void)event;
     (void)reserved;
+
+    pr_info("sehide: module v%s init (event=%s)\n", se_ver, event ? event : "?");
 
     /* 三级符号解析链绑定（syms[] 唯一填充点，必须在任何符号消费前执行；
      * 漏调 = 全部符号 MISSING = 引擎 off = 生态注入裸奔落 live） */
@@ -143,9 +147,10 @@ int se_install_engine(void)
          * 现行门行为 = 吸收进副本，非丢弃：特权 blob 经 se_absorb_blob
          * （se_policydb.c）解析（policydb_read 到新副本 → 类数校验 →
          * 镜像长度倒退保护 → 盖章 → se_retire_copy 换代）——生态规则
-         * 自此经副本在决策面收口查询生效。"丢弃 + 假成功"只是失败降级
+         * 自此经副本在决策面收口查询生效（仅特权路径；非特权对 /load 的
+         * 写被权限检查原版拒绝，不进入本门）。"丢弃 + 假成功"只是失败降级
          * 路径（pdb_read 失败/类数不匹配/stale blob/未就绪 → 丢弃且
-         * 返回 0）——红线：reject 返回会让 apd 静默退出、zygisk 全灭。
+         * 返回 0）——reject 返回会让 apd 静默退出、zygisk 不可用。
          * /policy 读门配套：apd 读到副本序列化再打包写回，避免单模块
          * blob 互相覆盖。live 恒干净，门对非特权照旧透传。 */
         if (se_install_load_gate())
@@ -158,7 +163,9 @@ int se_install_engine(void)
 
         /* status 页冻结门：非特权（uid>=10000）读到冻结的出厂快照
          * （policyload=1 / 真 enforcing），特权透传真实值——出厂覆盖
-         * live 走内核重载推高 policyload 时的前置保险。 */
+         * live 走内核重载推高 policyload 时的前置保险。仅非特权读路径
+         * 受影响；status 页不可读的机型上本门无服务对象，未装成
+         * 对任何路径均无影响。 */
         if (se_status_install())
             pr_info("sehide: status freeze not installed\n");
 
